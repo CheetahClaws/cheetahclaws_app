@@ -63,6 +63,8 @@ Slash commands in REPL:
   /plan done        Exit plan mode and restore permissions
   /plan status      Show plan mode status
   /brainstorm <topic>  Multi-persona iterative brainstorming session
+  /draft <msg>      Draft 3 candidate replies for a message (manual copy/paste)
+  /draft @<contact> <msg>   Same, but tone-conditioned on wx_contacts.json
   /worker           Auto-implement tasks from todo_list.txt
   /agent start <template> [args]  Autonomous agent loop (research_assistant / auto_bug_fixer / paper_writer / auto_coder)
   /agent stop <name>    Stop a running agent
@@ -227,7 +229,7 @@ from commands.checkpoint_plan import cmd_checkpoint, cmd_rewind, cmd_plan
 
 # ── Advanced commands ──────────────────────────────────────────────────────
 from commands.advanced import (
-    cmd_brainstorm, cmd_worker, cmd_ssj,
+    cmd_brainstorm, cmd_worker, cmd_ssj, cmd_draft,
     cmd_memory, cmd_agents, cmd_skills, cmd_mcp, cmd_plugin, cmd_tasks,
     _save_synthesis, _print_background_notifications,
 )
@@ -389,6 +391,7 @@ COMMANDS = {
     "image":       cmd_image,
     "img":         cmd_image,
     "brainstorm":  cmd_brainstorm,
+    "draft":       cmd_draft,
     "worker":      cmd_worker,
     "agent":       cmd_agent,
     "ssj":         cmd_ssj,
@@ -532,6 +535,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "image":       ("Send clipboard image to model",      []),
     "img":         ("Send clipboard image (alias)",       []),
     "brainstorm":  ("Multi-persona AI debate + auto tasks", []),
+    "draft":       ("Draft 3 reply candidates for a message (manual copy)", []),
     "worker":      ("Auto-implement pending tasks",       []),
     "agent":       ("Autonomous agent loop (task templates)", ["start", "stop", "list", "status", "templates"]),
     "ssj":         ("SSJ Developer Mode — power menu",    []),

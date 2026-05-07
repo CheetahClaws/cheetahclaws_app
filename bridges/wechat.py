@@ -370,7 +370,20 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
                         print(clr(f"\n  ✓ smart-reply panel resolved", "dim"))
                         continue
 
-                print(clr(f"\n  📩 WeChat [{from_uid[:8]}]: {text}", "cyan"))
+                print(clr(f"\n  📩 WeChat [{from_uid}]: {text}", "cyan"))
+
+                # ── /draft pick: digit-only reply consumes a pending draft ──
+                # If the user previously ran /draft and we have candidates
+                # cached for this uid, a bare "1"/"2"/"3" returns just the
+                # chosen line — no agent, no smart-reply panel. One-shot.
+                _stripped = text.strip()
+                if _stripped.isdigit() and 1 <= int(_stripped) <= 9:
+                    from bridges.draft_cache import take as _draft_take
+                    _picked = _draft_take(from_uid, int(_stripped))
+                    if _picked is not None:
+                        _wx_send(from_uid, _picked, config)
+                        print(clr(f"  ↳ /draft pick #{_stripped} sent", "dim"))
+                        continue
 
                 # ── Interactive PTY session ────────────────────────────────
                 from bridges.interactive_session import get_session, set_session, remove_session, InteractiveSession

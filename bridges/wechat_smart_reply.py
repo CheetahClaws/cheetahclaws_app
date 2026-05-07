@@ -281,16 +281,36 @@ def _build_prompt(message: str, sender_label: str,
 
 
 _LIST_RE = re.compile(r"^\s*[1-3][\.\)、]\s*(.+)$")
+# Defensive trim: cheap models occasionally cram a duplicate candidate onto
+# the tail of the previous one with no newline, e.g.
+#   "3. 不太确定1. 有空呀，想干嘛"
+# This regex finds the *next* numbered marker mid-string so we can cut there.
+_TAIL_NUM_RE = re.compile(r"\s*\d+\s*[\.\)、]\s")
 
 
 def _parse_candidates(text: str) -> list[str]:
     out: list[str] = []
+    seen: set[int] = set()
     for line in text.splitlines():
         m = _LIST_RE.match(line)
-        if m:
-            cand = m.group(1).strip().rstrip("。，,.!?！？")
-            if cand:
-                out.append(cand)
+        if not m:
+            continue
+        # Track seen indices so a duplicate "1. ..." line later in the
+        # response can't overwrite the real candidate 1.
+        idx_match = re.match(r"^\s*([1-3])", line)
+        idx = int(idx_match.group(1)) if idx_match else 0
+        if idx and idx in seen:
+            continue
+        cand = m.group(1).strip()
+        # Cut anything that looks like a second numbered item bleeding in.
+        cut = _TAIL_NUM_RE.search(cand)
+        if cut:
+            cand = cand[: cut.start()].strip()
+        cand = cand.rstrip("。，,.!?！？")
+        if cand:
+            if idx:
+                seen.add(idx)
+            out.append(cand)
     return out[:3]
 
 
