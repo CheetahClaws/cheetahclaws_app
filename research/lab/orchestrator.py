@@ -400,6 +400,10 @@ def _gather_search_context(run: LabRun, rq: str, *,
     Returns "" if the aggregator fails wholesale (network down, no
     sources available, etc.) so the surveyor falls back gracefully.
     Best-effort: a partial result is still better than no grounding.
+
+    Failure modes are logged to the message bus so /lab logs surfaces
+    *why* grounding skipped this run — silent fallback was unacceptable
+    when we couldn't tell missing keys from a real bug.
     """
     try:
         from research.aggregator import research as _research
@@ -416,10 +420,34 @@ def _gather_search_context(run: LabRun, rq: str, *,
             max_total_results=max_total,
             config=run.config,
         )
-    except Exception:
+    except Exception as exc:
+        run.storage.append_message(
+            run.state.run_id, stage=Stage.SURVEY.value, round_=0,
+            role="surveyor", kind="note",
+            content=(f"[grounding skipped] research.aggregator raised "
+                     f"{type(exc).__name__}: {exc}"),
+        )
         return ""
 
     if not brief or not getattr(brief, "results", None):
+        # Surface per-source failures so the user can fix them
+        # (e.g. set TAVILY_API_KEY or wait out a 429 burst).
+        statuses = getattr(brief, "statuses", None) if brief else None
+        diag_lines = []
+        if statuses:
+            for st in statuses:
+                if not getattr(st, "ok", False):
+                    diag_lines.append(
+                        f"  - {getattr(st, 'name', '?')}: "
+                        f"{getattr(st, 'error', 'no results')}"
+                    )
+        diag = "\n".join(diag_lines) if diag_lines else "  (no source diagnostics)"
+        run.storage.append_message(
+            run.state.run_id, stage=Stage.SURVEY.value, round_=0,
+            role="surveyor", kind="note",
+            content=(f"[grounding skipped] aggregator returned 0 results.\n"
+                     f"per-source status:\n{diag}"),
+        )
         return ""
 
     # Format hits compactly. Each hit ≈ 250 chars; cap on total chars.
