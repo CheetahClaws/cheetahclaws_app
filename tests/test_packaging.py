@@ -30,8 +30,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _read_pyproject() -> dict:
-    """Parse pyproject.toml. Uses tomllib (3.11+)."""
-    import tomllib
+    """Parse pyproject.toml.
+
+    `tomllib` is 3.11+ stdlib; on 3.10 we fall back to `tomli` (the
+    backport, which the project's Python 3.10 wheels already depend on
+    transitively via setuptools).  pyproject.toml `requires-python` is
+    `>=3.10`, so we must not assume 3.11.
+    """
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[import-not-found, no-redef]
     with open(_PROJECT_ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)
 

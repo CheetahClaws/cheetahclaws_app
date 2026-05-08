@@ -11,8 +11,8 @@ The "foundation PR" described at the end of [RFC 0001](./0001-daemon-design-note
 | ID  | Scope                                               | Depends on | Est LoC | Status |
 |-----|-----------------------------------------------------|------------|---------|--------|
 | F-1 | `daemon/` package skeleton; `serve` + `daemon` CLI  | —          | ~1500   | MERGED #80 |
-| F-2 | SQLite schema + events persistence + jobs migration | F-1        | ~700    | OPEN   |
-| F-3 | `monitor/scheduler` runs in daemon                  | F-2        | ~700    | OPEN   |
+| F-2 | SQLite schema + events persistence + jobs migration | F-1        | ~700    | MERGED #101 + follow-ups (#fix-f2) |
+| F-3 | `monitor/scheduler` runs in daemon                  | F-2        | ~700    | MERGED #101 + follow-ups (#fix-f2) |
 | F-4 | `agent_runner` becomes subprocess-per-agent         | F-2        | ~1000   | TODO   |
 | F-5 | `proactive` watcher runs in daemon                  | F-2        | ~200    | TODO   |
 | F-6 | Telegram bridge in daemon                           | F-2        | ~500    | TODO   |
@@ -109,8 +109,25 @@ is already provided by spike's `cc_daemon/originator.py` +
   publishes.
 - `jobs.py` — `_persist`/`_row_to_job` hit SQLite; `_ensure_migrated()`
   imports legacy `~/.cheetahclaws/jobs.json` once (tracked via
-  `schema_meta.jobs_migrated_from_json`).  JSON file is **left readable
-  in place** for one release as fallback.  Public API unchanged.
+  `schema_meta.jobs_migrated_from_json`).  Migration is **one-way**:
+  after the marker is set, edits to the JSON file are no longer read.
+  The file is left on disk for backward viewing only (prior-release
+  users, backup tooling); SQLite is the source of truth from then on.
+  Public API unchanged.
+
+**Follow-ups (#fix-f2).**
+- `cc_daemon/schema.py` sets `PRAGMA synchronous=NORMAL` on init and
+  on every thread-local connection.  Safe under WAL — only the most
+  recent transactions can be lost on hard kernel crash, which for an
+  event log already retention-pruned in 24 h windows is an acceptable
+  trade.  Microbenchmark: `EventBus.publish` of 10 K `text_chunk`
+  events drops from 305 μs/event to 39 μs/event (~8× — chauncygu
+  #74 review §7 follow-up).
+- `jobs.py` and `monitor/store.py` migration docstrings now make the
+  one-way semantics explicit (the original "kept readable for one
+  release as fallback" wording in PR #101 implied a fallback read
+  path that didn't exist; users editing the JSON expecting it to be
+  picked up would have been silently surprised).
 
 **Acceptance.**
 - `init_schema()` is idempotent across daemon restarts and concurrent
@@ -165,6 +182,22 @@ daemon is detected.
   detect a live daemon via `cc_daemon.discovery.locate()` and no-op
   with a friendly message.  `/monitor subscribe` / `unsubscribe` /
   `list` continue to work in REPL because they hit SQLite directly.
+
+**Follow-ups (#fix-f2).**
+- `cc_daemon/cli.py:cmd_serve` now starts `monitor.scheduler.start(...)`
+  **after** the listener has bound and the discovery file is on disk
+  (PR #101 had it before the bind).  Order matters — if a due
+  subscription fires before the daemon is reachable, an LLM/network
+  error in fetch/summarize/deliver surfaces in the log before the
+  user sees the listening line, and external clients can't yet act
+  on the resulting `monitor_report` SSE event.
+- `monitor/scheduler.py` — `_foreign_daemon_running()` step-aside
+  check at the top of every loop tick.  Closes the race where REPL
+  `/monitor start` fires in the brief window before the daemon
+  writes its discovery file: both schedulers would otherwise race on
+  `last_run_at` and double-fire subscriptions.  Daemon passes
+  `owned_by_daemon=True` to `start(...)` to opt out of the check
+  (otherwise it would defer to its own discovery entry forever).
 
 **Acceptance.**
 
