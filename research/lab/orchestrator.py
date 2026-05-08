@@ -700,7 +700,24 @@ def _stage_verification(run: LabRun) -> None:
         return
     try:
         from .verifier import verify_citations
-        result = verify_citations(citations, sleep_s=3.1)
+
+        def _progress(i: int, n: int, status: str) -> None:
+            run.storage.append_message(
+                s.run_id, stage=Stage.VERIFICATION.value, round_=0,
+                role="verifier", kind="note",
+                content=f"[{i}/{n}] {status}",
+            )
+
+        # Hard caps — without these a slow-loris socket on arxiv / SS
+        # hangs the run for tens of minutes (we observed 11 min in the
+        # field). Per-citation hard timeout = 30s, full stage = 5 min.
+        result = verify_citations(
+            citations,
+            sleep_s=3.1,
+            per_citation_hard_s=30.0,
+            stage_max_s=300.0,
+            progress_cb=_progress,
+        )
     except Exception as exc:
         run.storage.append_message(
             s.run_id, stage=Stage.VERIFICATION.value, round_=0,

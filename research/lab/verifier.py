@@ -92,13 +92,86 @@ class VerifierResult:
 def verify_citations(citations: list[Citation],
                      *, sleep_s: float = 3.1,
                      timeout_s: float = 10.0,
+                     per_citation_hard_s: float = 30.0,
+                     stage_max_s: float = 300.0,
+                     progress_cb=None,
                      ) -> VerifierResult:
-    verifs = []
-    for c in citations:
-        v = verify_one(c, timeout_s=timeout_s)
+    """Verify each citation against arxiv / SS / CrossRef.
+
+    Two layers of timeout protection — without these, a slow-loris
+    socket on any of the three APIs hangs the whole lab pipeline:
+
+      * ``per_citation_hard_s`` (default 30 s) is a wall-clock cap for
+        a single citation (which may hit up to 4 sub-APIs internally).
+        Enforced via ``concurrent.futures`` so a hung urlopen() is
+        actually interrupted at the language level — socket-level
+        timeout alone doesn't fire on slow byte-trickle servers.
+
+      * ``stage_max_s`` (default 5 min) is a wall-clock cap for the
+        whole verifier loop. Citations that haven't been processed when
+        the budget runs out get marked ``verification_skipped`` so
+        finalization can still produce a report.
+
+    ``progress_cb(i, n, status)`` is called after each citation —
+    used by /lab to surface progress to the REPL.
+    """
+    import concurrent.futures
+    verifs: list[CitationVerification] = []
+    t_start = time.time()
+    n = len(citations)
+
+    for i, c in enumerate(citations, 1):
+        elapsed = time.time() - t_start
+        if elapsed > stage_max_s:
+            # Budget exhausted — mark this and the remaining as skipped.
+            for cc in citations[i - 1:]:
+                verifs.append(CitationVerification(
+                    citation=cc, status="verification_skipped",
+                    notes=f"stage budget {stage_max_s:.0f}s exceeded "
+                          f"after {len(verifs)} citation(s)",
+                ))
+            if progress_cb:
+                try:
+                    progress_cb(i, n, "stage_budget_exceeded")
+                except Exception:
+                    pass
+            break
+
+        # Fresh single-worker executor per citation: if verify_one hangs
+        # on a slow socket, the worker thread is unkillable, so we don't
+        # want to reuse the pool (a queued submit would block forever
+        # behind the hung worker). With a per-citation pool we just leak
+        # the thread (daemon, dies with process) and move on.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(verify_one, c, timeout_s=timeout_s)
+            try:
+                v = future.result(timeout=per_citation_hard_s)
+            except concurrent.futures.TimeoutError:
+                v = CitationVerification(
+                    citation=c, status="verification_skipped",
+                    notes=f"hard timeout after {per_citation_hard_s:.0f}s",
+                )
+            except Exception as exc:
+                v = CitationVerification(
+                    citation=c, status="verification_skipped",
+                    notes=f"verifier error: {type(exc).__name__}: {exc}",
+                )
+        finally:
+            # wait=False: do NOT block on a hung worker thread before moving
+            # to the next citation. The daemon thread dies with the process.
+            pool.shutdown(wait=False)
         verifs.append(v)
-        # Be polite to arXiv even if we didn't actually call it for this one.
-        time.sleep(sleep_s)
+        if progress_cb:
+            try:
+                progress_cb(i, n, v.status)
+            except Exception:
+                pass
+        # Polite delay between successful calls; skip the sleep when we're
+        # about to overshoot the stage budget anyway.
+        if i < n and time.time() - t_start + sleep_s < stage_max_s:
+            time.sleep(sleep_s)
+
     counts = {"verified": 0, "ambiguous": 0, "not_found": 0,
               "verification_skipped": 0}
     for v in verifs:

@@ -112,6 +112,14 @@ def _cmd_start(topic: str, config: dict) -> bool:
     cancel = threading.Event()
     _cancel_flags[rec.run_id] = cancel
 
+    out_dir = Path.home() / ".cheetahclaws" / "research_papers" / rec.run_id
+    report_path = out_dir / "report.md"
+
+    def _on_stage_change(stage):
+        # Live-print stage transitions so the user can see progress in
+        # the REPL without polling /lab status.
+        print(clr(f"  ↳ /lab {rec.run_id}  ► {stage.value}", "dim"))
+
     def _runner():
         # Re-create the run inside the worker so we can pass cancel_check.
         from research.lab.orchestrator import _drive, LabRun, LabState, Stage
@@ -122,6 +130,7 @@ def _cmd_start(topic: str, config: dict) -> bool:
         run = LabRun(
             state=state, storage=storage, roles=roles, config=config,
             convergence=ConvergenceConfig(max_rounds=max_rounds),
+            on_stage_change=_on_stage_change,
         )
         storage.update_run_status(rec.run_id, "running",
                                    current_stage=state.stage.value)
@@ -135,10 +144,8 @@ def _cmd_start(topic: str, config: dict) -> bool:
             else:
                 storage.update_run_status(rec.run_id, "done",
                                           current_stage=state.stage.value)
-                out = (Path.home() / ".cheetahclaws" / "research_papers"
-                        / rec.run_id / "report.md")
                 print(clr(f"\n  ✓ /lab {rec.run_id}: done. "
-                          f"Report → {out}", "green"))
+                          f"Report → {report_path}", "green"))
         except Exception as exc:
             storage.update_run_status(rec.run_id, "failed",
                                       current_stage=state.stage.value,
@@ -152,7 +159,10 @@ def _cmd_start(topic: str, config: dict) -> bool:
     info(f"  topic       : {topic}")
     info(f"  budget      : {budget_tokens:,} tokens / ${budget_cost_cents/100:.2f}")
     info(f"  max_rounds  : {max_rounds} per stage")
-    info(f"  status      : /lab status {rec.run_id}")
+    info(f"  report path : {report_path}")
+    info(f"  watch live  : stage transitions print here as they happen")
+    info(f"  poll        : /lab status {rec.run_id}")
+    info(f"  details     : /lab logs {rec.run_id}")
     info(f"  abort       : /lab abort {rec.run_id}")
     return True
 
@@ -533,9 +543,16 @@ def _cmd_daemon(arg: str, config: dict) -> bool:
     if sub == "start":
         h = _bl.start_daemon(config=config)
         if h.thread.is_alive():
+            from research.lab.storage import LabStorage
+            pending = LabStorage().list_backlog(status="pending")
             ok("Lab daemon running. Pulls from /lab backlog continuously.")
             info(f"  started_at : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(h.started_at))}")
-            info("  stop with  : /lab daemon stop")
+            info(f"  pending    : {len(pending)} item(s) in queue")
+            info(f"  reports → ~/.cheetahclaws/research_papers/<run_id>/report.md")
+            info(f"  watch live : stage transitions print here as the daemon runs")
+            info(f"  poll       : /lab status   |   /lab status <run_id>")
+            info(f"  abort run  : /lab abort <run_id>")
+            info(f"  stop daemon: /lab daemon stop")
         else:
             err("Daemon failed to start.")
         return True

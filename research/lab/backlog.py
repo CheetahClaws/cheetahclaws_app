@@ -114,7 +114,39 @@ def run_backlog_worker(*, config: dict,
         run_id: Optional[str] = None
         item_status = "failed"
         notes = ""
+        # Default progress sink — print every stage transition so the
+        # REPL shows live activity without the user polling /lab status.
+        # Caller can override via config["lab_daemon_silent"]=True.
+        from pathlib import Path as _Path
+        from ui.render import clr as _clr
+        silent = bool(config.get("lab_daemon_silent", False))
+
+        def _stage_pr(stage):
+            # run_id closure is None until run_one_lab_session returns,
+            # so we look up the active run via storage. Cheap (1 SELECT).
+            if silent:
+                return
+            try:
+                rid = run_id
+                if not rid:
+                    runs = storage.list_runs(status="running", limit=1)
+                    rid = runs[0].run_id if runs else "?"
+            except Exception:
+                rid = "?"
+            print(_clr(f"  ↳ /lab daemon  ► [{rid}] {stage.value}", "dim"))
+
         try:
+            # Pre-print so the user knows where the eventual report lands
+            # *before* the orchestrator starts producing.
+            if not silent:
+                topic_short = item["topic"][:60] + (
+                    "…" if len(item["topic"]) > 60 else "")
+                print(_clr(
+                    f"  ↳ /lab daemon  ▶ starting backlog #{item['id']}: "
+                    f"{topic_short}",
+                    "cyan",
+                ))
+
             # ── 1. Run the topic ──────────────────────────────────────
             run = run_one_lab_session(
                 topic=item["topic"],
@@ -126,8 +158,18 @@ def run_backlog_worker(*, config: dict,
                 role_override=config.get("lab_role_override"),
                 call_llm=call,
                 cancel_check=stop_event.is_set,
+                on_stage_change=_stage_pr,
             )
             run_id = run.state.run_id
+
+            if not silent:
+                report_path = (_Path.home() / ".cheetahclaws"
+                               / "research_papers" / run_id / "report.md")
+                print(_clr(
+                    f"  ↳ /lab daemon  📄 [{run_id}] will save to: "
+                    f"{report_path}",
+                    "dim",
+                ))
 
             # Link the run early so /lab backlog list shows progress
             storage.update_backlog(item_id=item["id"], run_id=run_id)

@@ -67,6 +67,80 @@ def test_dedupe_self_repeat_sanity_floor_prevents_overtrim():
     assert len(out) >= 60
 
 
+def test_verify_citations_per_citation_hard_timeout(monkeypatch):
+    """If verify_one hangs, the wall-clock cap must kick in and mark the
+    citation skipped — not block the whole stage forever (we observed
+    11 minutes of hang on a slow-loris arxiv socket in the field)."""
+    from research.lab.verifier import (
+        verify_citations, Citation, CitationVerification,
+    )
+
+    def _hangs_forever(*args, **kwargs):
+        time.sleep(120)
+        return CitationVerification(citation=args[0], status="verified")
+
+    monkeypatch.setattr("research.lab.verifier.verify_one", _hangs_forever)
+
+    cits = [Citation(key=f"hung{i}", title=f"hung paper #{i}", authors=[]) for i in range(2)]
+    t0 = time.time()
+    result = verify_citations(
+        cits, sleep_s=0.0,
+        per_citation_hard_s=1.0,    # 1-second cap so the test is fast
+        stage_max_s=10.0,
+    )
+    elapsed = time.time() - t0
+    assert elapsed < 4.0, f"verifier didn't honour hard timeout (took {elapsed:.1f}s)"
+    assert result.n_skipped == 2
+    assert result.n_verified == 0
+    assert all(v.status == "verification_skipped" for v in result.verifications)
+    assert all("hard timeout" in (v.notes or "") for v in result.verifications)
+
+
+def test_verify_citations_stage_budget(monkeypatch):
+    """If the stage runs out of total wall time, remaining citations get
+    marked skipped without being attempted."""
+    from research.lab.verifier import verify_citations, Citation, CitationVerification
+
+    call_log = []
+    def _slow(citation, *, timeout_s=10.0):
+        call_log.append(citation.title)
+        time.sleep(0.4)   # each call eats some of the stage budget
+        return CitationVerification(citation=citation, status="not_found")
+
+    monkeypatch.setattr("research.lab.verifier.verify_one", _slow)
+
+    cits = [Citation(key=f"p{i}", title=f"paper {i}", authors=[]) for i in range(10)]
+    result = verify_citations(
+        cits, sleep_s=0.0,
+        per_citation_hard_s=2.0,
+        stage_max_s=1.0,    # tiny budget — should bail after a few calls
+    )
+    # Some calls actually ran, the rest were marked skipped.
+    n_attempted = len(call_log)
+    n_skipped_due_budget = sum(
+        1 for v in result.verifications
+        if v.notes and "stage budget" in v.notes
+    )
+    assert n_attempted >= 1 and n_attempted < 10
+    assert n_skipped_due_budget >= 1
+    assert len(result.verifications) == 10  # all 10 are accounted for either way
+
+
+def test_verify_citations_progress_callback(monkeypatch):
+    from research.lab.verifier import verify_citations, Citation, CitationVerification
+    monkeypatch.setattr(
+        "research.lab.verifier.verify_one",
+        lambda c, **_: CitationVerification(citation=c, status="verified"),
+    )
+    cits = [Citation(key=f"k{i}", title=f"p{i}", authors=[]) for i in range(3)]
+    seen = []
+    verify_citations(
+        cits, sleep_s=0.0, stage_max_s=10.0,
+        progress_cb=lambda i, n, status: seen.append((i, n, status)),
+    )
+    assert seen == [(1, 3, "verified"), (2, 3, "verified"), (3, 3, "verified")]
+
+
 def test_extract_numbered_dedupes_repeated_list():
     """questioner emits 5 RQs then 5 duplicates → keep 5."""
     text = (
