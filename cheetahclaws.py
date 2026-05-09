@@ -1116,15 +1116,19 @@ def repl(config: dict, initial_prompt: str = None):
             return "simple"
         # Process sentinels the same way the REPL does
         if result[0] == "__brainstorm__":
-            _, brain_prompt, brain_out_file = result
-            run_query(brain_prompt)
-            _save_synthesis(state, brain_out_file)
+            _, brain_payload, brain_out_file = result
             _todo_path = str(Path(brain_out_file).parent / "todo_list.txt")
             run_query(
-                f"Based on the Master Plan you just synthesized, generate a todo list file at {_todo_path}. "
-                "Format: one task per line, each starting with '- [ ] '. "
-                "Order by priority. Include ALL actionable items from the plan. "
-                "Use the Write tool to create the file. Do NOT explain, just write the file now."
+                brain_payload + "\n\n"
+                f"Now write the todo list file at {_todo_path}.\n\n"
+                "STRICT RULES:\n"
+                "1. Call Write EXACTLY ONCE with the full todo content. "
+                "One task per line, each starting with '- [ ] '. Order "
+                "by priority. Keep names / numbers / paths intact.\n"
+                "2. Do NOT call Read — there is nothing to read.\n"
+                "3. Do NOT call Bash to verify the file was created.\n"
+                "4. Do NOT echo the file content back after Write.\n"
+                "5. After the single Write succeeds, your turn ENDS."
             )
         elif result[0] == "__worker__":
             _, worker_tasks = result
@@ -1364,7 +1368,18 @@ def repl(config: dict, initial_prompt: str = None):
         # so command arguments aren't accidentally rstripped.
         if user_input != user_input.lstrip():
             user_input = user_input.lstrip()
-        result = handle_slash(user_input, state, config)
+        # Wrap in KeyboardInterrupt guard so Ctrl+C during a slow
+        # synchronous slash command (/monitor run, /research, /trading
+        # backtest, etc.) just cancels that command and returns to the
+        # prompt, instead of unwinding the whole REPL → main() → process.
+        # The previous behavior printed a traceback through atexit and
+        # left the user at a bash shell.
+        try:
+            result = handle_slash(user_input, state, config)
+        except KeyboardInterrupt:
+            _track_ctrl_c()
+            print(clr("\n  (command interrupted)", "yellow"))
+            continue
         # ── Sentinel processing loop ──
         # Processes sentinel tuples returned by commands. SSJ-originated
         # sentinels loop back to the SSJ menu after completion.
@@ -1405,7 +1420,13 @@ def repl(config: dict, initial_prompt: str = None):
                 if slash_line.strip().lower() == "/ssj":
                     result = handle_slash("/ssj", state, config)
                     continue
-                inner = handle_slash(slash_line, state, config)
+                try:
+                    inner = handle_slash(slash_line, state, config)
+                except KeyboardInterrupt:
+                    _track_ctrl_c()
+                    print(clr("\n  (command interrupted)", "yellow"))
+                    result = handle_slash("/ssj", state, config)
+                    continue
                 if isinstance(inner, tuple):
                     result = inner
                     continue
@@ -1415,7 +1436,13 @@ def repl(config: dict, initial_prompt: str = None):
             # Delegate to the real command and re-process its returned sentinel
             if result[0] == "__ssj_cmd__":
                 _, cmd_name, cmd_args = result
-                inner = handle_slash(f"/{cmd_name} {cmd_args}".strip(), state, config)
+                try:
+                    inner = handle_slash(f"/{cmd_name} {cmd_args}".strip(), state, config)
+                except KeyboardInterrupt:
+                    _track_ctrl_c()
+                    print(clr("\n  (command interrupted)", "yellow"))
+                    result = handle_slash("/ssj", state, config)
+                    continue
                 if isinstance(inner, tuple):
                     # Tag so we know to loop back to SSJ after processing
                     result = ("__ssj_wrap__", inner)
@@ -1431,20 +1458,36 @@ def repl(config: dict, initial_prompt: str = None):
             else:
                 _from_ssj_flag = result[0] == "__ssj_query__"
 
-            # Brainstorm sentinel: ("__brainstorm__", synthesis_prompt, out_file)
+            # Brainstorm sentinel: ("__brainstorm__", todo_payload, out_file)
+            # The lead moderator now does opening + probe + synthesis inside
+            # cmd_brainstorm and writes everything to out_file. todo_payload
+            # already inlines the master plan, so the main agent only needs
+            # to write the TODO file — no Read, no re-synthesis. This
+            # eliminates the duplicate-Read pattern that weak models like
+            # qwen2.5 fell into when asked to Read-then-rewrite.
             if result[0] == "__brainstorm__":
-                _, brain_prompt, brain_out_file = result
-                print(clr("\n  ── Analysis from Main Agent ──", "dim"))
+                _, brain_payload, brain_out_file = result
+                _todo_path = str(Path(brain_out_file).parent / "todo_list.txt")
+                print(clr("\n  ── Generating TODO List from Lead Synthesis ──", "dim"))
                 try:
-                    run_query(brain_prompt)
-                    _save_synthesis(state, brain_out_file)
-                    _todo_path = str(Path(brain_out_file).parent / "todo_list.txt")
-                    print(clr("\n  ── Generating TODO List from Master Plan ──", "dim"))
                     run_query(
-                        f"Based on the Master Plan you just synthesized, generate a todo list file at {_todo_path}. "
+                        brain_payload + "\n\n"
+                        f"Now write the todo list file at {_todo_path}.\n\n"
+                        "STRICT RULES:\n"
+                        "1. Call Write EXACTLY ONCE with the full todo content. "
                         "Format: one task per line, each starting with '- [ ] '. "
-                        "Order by priority. Include ALL actionable items from the plan. "
-                        "Use the Write tool to create the file. Do NOT explain, just write the file now."
+                        "Order by priority. Include every concrete action from "
+                        "the master plan above (keep names / numbers / paths "
+                        "intact — do NOT generalize).\n"
+                        "2. Do NOT call Read — there is nothing to read.\n"
+                        "3. Do NOT call Bash to verify the file was created. "
+                        "The Write tool's success message is sufficient.\n"
+                        "4. Do NOT echo the file content back as text after "
+                        "Write succeeds. The file is on disk; the user can "
+                        "open it themselves.\n"
+                        "5. After the single Write succeeds, your turn ENDS. "
+                        "Do not write any further text. Do not summarize. "
+                        "Do not ask follow-up questions."
                     )
                     info(f"TODO list saved to {_todo_path}. Edit it freely, then use /worker to start implementing.")
                 except KeyboardInterrupt:

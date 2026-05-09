@@ -41,7 +41,7 @@ If you remember only one thing, remember this flow:
   - `_register_builtins()` registers core tools, then imports package tool modules to auto-register additional tools.
 
 ### Model providers + prompt context + compaction
-- `providers.py` — provider detection, model metadata, API key lookup, stream adapters, neutral message format conversion.
+- `providers.py` — provider detection, model metadata, API key lookup, stream adapters, neutral message format conversion.  Includes the `nim` provider (build.nvidia.com free tier, OpenAI-compat) with its 429-cascade helper `nim_next_model()` used by the agent loop to swap to the next model in the curated chain on rate-limit, capped at 3 swaps/turn.
 - `context.py` — system prompt assembly entry point (`build_system_prompt`); injects env block + memory + tmux/plan fragments around the base prompt.
 - `prompts/` — system prompt assets as plain Markdown.  `base/default.md` is the shared baseline for every model; `overlays/<family>.md` (claude / gemini / openai-reasoning / qwen) appends short, vendor-documented quirks; `fragments/{tmux,plan}.md` are conditional blocks.  `select.py::pick_base_prompt` assembles base + matched overlay.  See `prompts/README.md` for the overlay-admission policy.
 - `compaction.py` — context window management (`snip_old_tool_results` + `compact_messages`).
@@ -100,6 +100,17 @@ Use this package for status transitions, dependency graph behavior, metadata sem
 - REPL command wiring lives in `cheetahclaws.py` (`cmd_checkpoint`, `cmd_rewind`).
 
 Use this package for snapshot policies, backup strategies, file restore behavior, or storage format updates.
+
+## Brainstorm (`commands/advanced.py:cmd_brainstorm`)
+- Multi-persona moderated debate. Run as `/brainstorm [flags] <topic>` or via `/ssj` → 1.
+- Three flags, all optional, all compose:
+  - `--rounds N` — number of debate rounds, clamp `[1, 6]`, default 2. Round 1 is initial positions; round 2+ is **adversarial cross-examination** (each persona MUST quote another agent's claim and attack it with a falsifiable counter).
+  - `--lead <model>` — lead-moderator model (opening + probes + synthesis). Default = current session model.
+  - `--models a,b,c` — persona models, distributed round-robin. Default = current session model for every persona. Multi-model brings real epistemic diversity (Claude + GPT + DeepSeek covers different blind spots).
+- Pipeline (in-process, no main-agent invocation): `_lead_opening` (sets agenda + bans filler) → for each round: persona speaks → `_lead_probe` (round 1 = vague-vs-concrete; round 2+ = dodge detector) → optional persona follow-up if probed → `_lead_synthesis` (structured master plan with Consensus / Dissents / Concrete Action Plan / What Was Filler sections).
+- Returns sentinel `("__brainstorm__", todo_payload, out_file_abs)` where `todo_payload` inlines the master plan so the main agent only writes the TODO file (no Read needed — eliminates the duplicate-Read pattern weak models fell into).
+- Test files: `tests/test_brainstorm_lead.py` (helpers + flag parsing + round-aware probe), `tests/test_brainstorm_models_flag.py` (--models parser).
+- User-facing guide: [`docs/guides/brainstorm.md`](guides/brainstorm.md).
 
 ## Voice (`voice/`)
 - `voice/recorder.py` capture backends (`sounddevice`, `arecord`, `sox`) + silence detection.

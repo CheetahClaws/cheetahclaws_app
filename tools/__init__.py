@@ -455,19 +455,26 @@ def execute_tool(
             return ask_permission(desc)
         return False  # deny by default when no permission handler is set
 
+    # NOTE: read fields with `.get(..., "")` rather than `inputs[...]`. When
+    # a weak model fires a tool_call with empty/missing args (qwen2.5 + vLLM
+    # is a known offender — see news.md "Be agentic on every model" entry),
+    # the registered ToolDef's lambda already returns a friendly "missing
+    # required parameter X" string that the model can self-correct from.
+    # Raising KeyError here masks that path and surfaces a confusing
+    # `Error executing Write: KeyError: 'file_path'` instead.
     if name == "Write":
-        if not _check(f"Write to {inputs['file_path']}"):
+        if not _check(f"Write to {inputs.get('file_path', '<missing path>')}"):
             return "Denied: user rejected write operation"
     elif name == "Edit":
-        if not _check(f"Edit {inputs['file_path']}"):
+        if not _check(f"Edit {inputs.get('file_path', '<missing path>')}"):
             return "Denied: user rejected edit operation"
     elif name == "Bash":
-        cmd = inputs["command"]
+        cmd = inputs.get("command", "") or ""
         if permission_mode != "accept-all" and not _is_safe_bash(cmd):
-            if not _check(f"Bash: {cmd}"):
+            if not _check(f"Bash: {cmd or '<missing command>'}"):
                 return "Denied: user rejected bash command"
     elif name == "NotebookEdit":
-        if not _check(f"Edit notebook {inputs['notebook_path']}"):
+        if not _check(f"Edit notebook {inputs.get('notebook_path', '<missing path>')}"):
             return "Denied: user rejected notebook edit operation"
 
     return _registry_execute(name, inputs, cfg)

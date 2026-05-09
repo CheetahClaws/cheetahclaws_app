@@ -19,6 +19,376 @@ from tools import _is_in_tg_turn, _is_in_web_turn
 
 # ── Brainstorm ─────────────────────────────────────────────────────────────
 
+
+def _parse_rounds_flag(args: str) -> tuple[int | None, str]:
+    """Pull `--rounds N` out of `args`, return (N_or_None, remaining).
+
+    A round = every persona speaks once. Rounds > 1 are critique/revise
+    rounds — personas see the full transcript and are explicitly asked
+    to engage with what others said, not repeat their initial position.
+    Default (no flag) is 2 rounds (initial positions + one critique
+    round) which is what makes the result feel like an actual debate
+    rather than three monologues stapled together.
+
+    Capped to [1, 6] — beyond 6 rounds the marginal value drops sharply
+    and token cost grows linearly.
+    """
+    import re as _re_rounds
+    m = _re_rounds.search(r"--rounds(?:=|\s+)(\d+)", args)
+    if not m:
+        return None, args
+    n = max(1, min(int(m.group(1)), 6))
+    return n, (args[:m.start()] + args[m.end():]).strip()
+
+
+def _parse_lead_flag(args: str) -> tuple[str | None, str]:
+    """Pull `--lead <model>` out of `args`, return (lead_model_or_None, remaining).
+
+    The lead is a separate model that opens the debate (frames the agenda
+    and what to AVOID), probes weak/vague claims after each persona, and
+    produces the final dense synthesis. Default (no flag) reuses
+    config["model"] for all three roles.
+    """
+    import re as _re_lead
+    pattern = _re_lead.compile(r"--lead(?:=|\s+)([^\s]+)")
+    m = pattern.search(args)
+    if not m:
+        return None, args
+    return m.group(1), (args[:m.start()] + args[m.end():]).strip()
+
+
+_WEAK_LEAD_FAMILIES = (
+    "qwen", "qwq", "llama-3.2", "llama-3.1-8b", "llama-3.3-8b",
+    "gemma", "phi-3", "phi-4-mini", "mistral-7b", "kimi-7b",
+    "minimax-text", "abab", "deepseek-coder-6", "qwen2.5-coder-7",
+    "qwen2.5-7b", "qwen2-7b",
+)
+
+
+def _is_weak_lead_model(model_id: str) -> bool:
+    """Return True if `model_id` looks like a chat-tuned small / weak
+    family that historically struggles with the lead-moderator role
+    (running the opening + probes + synthesis adversarially).
+
+    Used only to print a one-time warning recommending a stronger model
+    via `--lead`. Never silently overrides the user's choice."""
+    if not model_id:
+        return False
+    tail = model_id.rsplit("/", 1)[-1].lower()
+    return any(fam in tail for fam in _WEAK_LEAD_FAMILIES)
+
+
+def _extract_challenge_blocks(text: str) -> list[str]:
+    """Pull the body of every `### [CHALLENGE → Agent X]` block out of a
+    persona's round-2+ response. Returns a list of normalised strings
+    (lower-cased, whitespace-collapsed, max 500 chars each) suitable for
+    similarity comparison. Empty list if no challenge blocks found."""
+    import re as _re_ch
+    if not text:
+        return []
+    # Match heading `### [CHALLENGE` (or with → arrow / minor spelling
+    # variation), capture body until next `###` heading or EOF.
+    pattern = _re_ch.compile(
+        r"###\s*\[?CHALLENGE.*?\](.*?)(?=###|\Z)",
+        _re_ch.DOTALL | _re_ch.IGNORECASE,
+    )
+    out: list[str] = []
+    for m in pattern.finditer(text):
+        body = m.group(1).strip()
+        # Normalise: lowercase, collapse whitespace, cap length
+        body_norm = _re_ch.sub(r"\s+", " ", body.lower())[:500]
+        if body_norm:
+            out.append(body_norm)
+    return out
+
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Token-set Jaccard overlap of two strings. Cheap, language-agnostic
+    enough to catch the qwen2.5 copy-paste pattern (round 2+ personas
+    cloning another agent's CHALLENGE verbatim with maybe a word changed)."""
+    if not a or not b:
+        return 0.0
+    import re as _re_jac
+    # Tokenise on word boundaries; keeps Chinese as runs of CJK chars.
+    tok_a = set(_re_jac.findall(r"\w+", a))
+    tok_b = set(_re_jac.findall(r"\w+", b))
+    if not tok_a or not tok_b:
+        return 0.0
+    inter = len(tok_a & tok_b)
+    union = len(tok_a | tok_b)
+    return inter / union if union else 0.0
+
+
+def _is_redundant_challenge(new_text: str, prior_history: list[str],
+                              threshold: float = 0.7) -> tuple[bool, float]:
+    """Decide whether `new_text`'s CHALLENGE blocks duplicate any prior
+    one in `prior_history`. Returns (is_redundant, max_similarity).
+
+    `threshold` of 0.7 was picked empirically against the failure case
+    in `brainstorm_outputs/brainstorm_20260509_000935.md` where 8 of 10
+    round-2+ challenges were verbatim clones of the first one (Jaccard
+    > 0.95). 0.7 is lenient enough to allow legitimate "two agents
+    independently challenge the same claim with different angles".
+    """
+    new_blocks = _extract_challenge_blocks(new_text)
+    if not new_blocks:
+        return False, 0.0
+    prior_blocks: list[str] = []
+    for h in prior_history:
+        prior_blocks.extend(_extract_challenge_blocks(h))
+    if not prior_blocks:
+        return False, 0.0
+    max_sim = 0.0
+    for nb in new_blocks:
+        for pb in prior_blocks:
+            sim = _jaccard_similarity(nb, pb)
+            if sim > max_sim:
+                max_sim = sim
+    return max_sim >= threshold, max_sim
+
+
+def _llm_oneshot(model: str, system: str, user: str, config: dict, max_chunks: int = 4000) -> str:
+    """Single-turn LLM call with no tools, returns concatenated text.
+
+    Used by the lead helpers below — opening / probe / synthesis all want
+    a clean prose response with no tool plumbing involved. Failures are
+    silent (return ""); callers fall back to skipping the stage so a
+    flaky lead model never breaks the brainstorm flow.
+    """
+    from providers import stream, TextChunk
+    internal = config.copy()
+    internal["no_tools"] = True
+    chunks: list[str] = []
+    try:
+        for ev in stream(model, system, [{"role": "user", "content": user}], [], internal):
+            if isinstance(ev, TextChunk):
+                chunks.append(ev.text)
+                if len(chunks) >= max_chunks:
+                    break
+    except Exception:
+        return ""
+    return "".join(chunks).strip()
+
+
+def _lead_opening(topic: str, snapshot: str, lead_model: str, config: dict) -> str:
+    """Lead opens the debate: defines what success looks like, what to
+    REJECT (no platitudes, no 'consult an advisor', demand specifics),
+    and warns the experts that round 2+ is adversarial cross-examination
+    — politeness is forbidden.
+
+    Empty string on failure — the caller continues without an opening,
+    which degrades to the previous behavior, not a crash."""
+    sys = (
+        "You are the LEAD MODERATOR of an expert debate. You are not one "
+        "of the experts — you set the agenda and you enforce quality. "
+        "You will be judged on whether the final debate is ACTIONABLE "
+        "and whether the experts ACTUALLY challenged each other instead "
+        "of taking turns being polite."
+    )
+    user = f"""TOPIC: {topic}
+
+PROJECT CONTEXT:
+{snapshot[:2000]}
+
+Your job NOW (the opening): write a tight 8-12 line briefing that the
+debate will be anchored to. The briefing MUST contain, in this order:
+
+1. What concrete artifact would make this debate USEFUL — name the unit
+   of an answer the user actually needs (e.g. "specific tickers with a
+   thesis, not 'consider semiconductors'"; "concrete config keys with
+   defaults, not 'add observability'"; "named refactors with file paths,
+   not 'improve modularity'"). Be very specific to THIS topic.
+2. The 2-3 cheap escape hatches we will NOT accept. Examples by category:
+   - Generic disclaimers ("consult a financial advisor", "do your own
+     research", "this is not legal advice").
+   - "Consider diversification / consult experts / monitor regularly"
+     style filler.
+   - Restating the question as the answer.
+3. The single hardest question the experts must answer to make their
+   contribution worth reading.
+4. **Cross-examination rule for round 2+**: in any round after the first,
+   each expert MUST quote a specific claim from another expert (by letter)
+   and either attack it with a counter-claim OR explicitly accept it.
+   Polite agreement counts as a dodge. The lead will probe any expert
+   who fails to engage adversarially.
+
+Output ONLY the briefing as plain Markdown. No preamble. No "here is
+your briefing:". Start with `### Lead Opening — Debate Anchor`."""
+    return _llm_oneshot(lead_model, sys, user, config)
+
+
+def _lead_probe(topic: str, persona_role: str, persona_letter: str,
+                persona_text: str, lead_model: str, config: dict,
+                round_num: int = 1) -> str:
+    """Lead reads the latest persona's contribution and decides if it's
+    too vague / dodging / non-adversarial. Returns a short pointed
+    follow-up question if so, or empty string if the persona was
+    concrete and (in round 2+) actually challenged someone.
+
+    Round 1: concrete vs vague check.
+    Round 2+: also requires explicit `[CHALLENGE → Agent X]`-style attack
+    on a specific named claim from another agent. A polite "I agree and
+    would add" reply in round 2+ counts as DODGING and earns a probe."""
+    if round_num >= 2:
+        sys = (
+            "You are the LEAD MODERATOR of an ADVERSARIAL debate. Your job "
+            "in this cross-examination round is to make sure no expert dodges "
+            "by being polite. A round-2+ contribution that restates the "
+            "agent's own view, agrees with others, or summarizes the debate "
+            "is a DODGE — even if it's well-written and concrete. Real "
+            "engagement requires quoting another agent's specific claim and "
+            "attacking it."
+        )
+        user = f"""TOPIC: {topic}
+
+LATEST CONTRIBUTION (Agent {persona_letter} — {persona_role}, in a
+ROUND-2+ CROSS-EXAMINATION round):
+{persona_text[:2500]}
+
+Decide which case applies:
+
+A. The contribution contains at least one CHALLENGE block where the
+   agent quotes a specific claim from another agent (by letter) and
+   attacks it with a counter-claim. → respond with:
+       NO_PROBE
+
+B. The contribution is a polite agreement, a synthesis, a defense-only
+   reply, restates the agent's own round-1 ideas, or doesn't quote anyone
+   else. → respond with one short question (≤30 words) that names a
+   specific agent and claim they should challenge:
+       `> Lead to Agent {persona_letter}: Agent X said "...". Attack it
+       or accept it — your call, but commit. Quote and refute, don't dodge.`
+
+Do NOT explain your decision. Output exactly one of the two forms."""
+    else:
+        sys = (
+            "You are the LEAD MODERATOR. Your job is to keep experts honest. "
+            "If the latest contribution is concrete and answers the anchor, "
+            "you stay silent. If it's vague, generic, or dodges the question, "
+            "you ask ONE pointed follow-up that demands a specific commitment."
+        )
+        user = f"""TOPIC: {topic}
+
+LATEST CONTRIBUTION (Agent {persona_letter} — {persona_role}):
+{persona_text[:2500]}
+
+Decide: is this concrete and useful, or is it filler?
+
+If CONCRETE (names specific things, takes a position, gives numbers /
+file paths / tickers / config keys / commands), respond with the single
+literal token:
+    NO_PROBE
+
+If VAGUE (uses 'consider', 'evaluate', 'should', 'monitor regularly',
+'consult experts', 'diversify' without naming what, etc.), respond
+with one short question (≤25 words) that demands a specific commitment.
+Format: `> Lead to Agent {persona_letter}: <question>`
+
+Do NOT explain your decision. Output exactly one of the two forms."""
+    out = _llm_oneshot(lead_model, sys, user, config).strip()
+    if not out or out.upper().startswith("NO_PROBE"):
+        return ""
+    # Trim accidental wrapping fences / prefixes
+    if out.startswith("```"):
+        out = out.strip("`").strip()
+    return out
+
+
+def _lead_synthesis(topic: str, transcript: str, lead_model: str,
+                    config: dict, opening: str = "") -> str:
+    """Lead produces the final structured synthesis. NO tool calls
+    needed — the entire transcript is in the prompt context. This is
+    what replaces the old "main agent reads file then synthesizes"
+    flow that caused the duplicate-Read bug.
+
+    `opening` is the lead's own debate-opening text (the agenda + ban
+    list it set at the start). When provided, the synthesis prompt
+    explicitly forces the lead to check its own action plan against
+    its own ban list — closing the failure case where the synthesis
+    listed "consult an advisor" as filler in the same document where
+    its action plan included "discuss with a financial advisor"."""
+    sys = (
+        "You are the LEAD MODERATOR producing the final synthesis. The "
+        "user will read THIS document and act on it. Filler is malpractice. "
+        "You set the ban list yourself in the opening — DO NOT contradict "
+        "yourself by recommending what you forbid."
+    )
+    opening_block = (
+        f"YOUR OWN OPENING (the agenda + ban list YOU set at the start; "
+        f"every action you propose below must obey this):\n\n{opening}\n\n---\n\n"
+        if opening else ""
+    )
+    user = f"""TOPIC: {topic}
+
+{opening_block}FULL DEBATE TRANSCRIPT (each section is one expert's
+contribution, in the order they spoke):
+
+{transcript}
+
+Produce the synthesis as Markdown with EXACTLY these four sections,
+in this order:
+
+## Consensus
+A bulleted list of claims that ≥2 experts backed. For each bullet,
+end with `(backed by: A, C)` listing the agent letters. Each claim
+must be SPECIFIC — name what / how much / which file / which ticker.
+If experts only agreed at the abstract level ("we should diversify"),
+do NOT list that — drop it instead.
+
+## Dissents
+Bullet list of claims where experts disagreed, each phrased as
+`X says A, Y says B — bottom line: <your call as moderator>`. If no
+real disagreement, write a single line: `No substantive dissents.`
+
+## Concrete Action Plan
+A NUMBERED list of 5-10 actions the user can take TOMORROW. Each
+action must have:
+  - A specific noun (a ticker / file path / config key / command /
+    person to call) — never "research X" without naming the next
+    output of that research.
+  - An owner if applicable (you, the user, an advisor).
+  - A binary done/not-done acceptance criterion.
+
+**SELF-CHECK BEFORE WRITING THIS SECTION**: re-read the ban list in
+your opening above. If any action you're about to write matches a
+banned escape hatch (e.g. "consult an advisor", "diversify",
+"monitor regularly", "research X" without naming what), REWRITE the
+action to be specific — or DELETE it. The contradiction of banning
+something then recommending it is unacceptable.
+
+## What Was Filler
+1-3 bullets calling out the cheap escape hatches the experts tried
+(if any). Be blunt. If none, omit the section entirely.
+
+Output ONLY the four sections. No preamble. No "here is the synthesis"."""
+    return _llm_oneshot(lead_model, sys, user, config)
+
+
+def _parse_models_flag(args: str) -> tuple[list[str], str]:
+    """Pull `--models a,b,c` out of `args`, return (models, remaining_args).
+
+    Supports both `--models a,b,c` and `--models=a,b,c`. Models are not
+    validated here — providers.detect_provider does that lazily on first
+    use. The remaining args (with the flag stripped) become the topic.
+
+    Why this matters: a single-model brainstorm is an echo chamber — every
+    persona shares the same training data and blind spots. Letting each
+    persona run a different model (Claude critic + GPT optimist + DeepSeek
+    pragmatist) buys real epistemic diversity. Borrowed in spirit from
+    Dulus's RoundtableAgent (webchat_server.py).
+    """
+    import re as _re_models
+    out_models: list[str] = []
+    pattern = _re_models.compile(r"--models(?:=|\s+)([^\s]+)")
+    m = pattern.search(args)
+    if not m:
+        return [], args
+    raw = m.group(1)
+    out_models = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    remaining = (args[:m.start()] + args[m.end():]).strip()
+    return out_models, remaining
+
+
 _TECH_PERSONAS = {
     "architect":   {"icon": "🏗️", "role": "Principal Software Architect",       "desc": "Focus on modularity, clear boundaries, patterns, and long-term maintainability."},
     "innovator":   {"icon": "💡", "role": "Pragmatic Product Innovator",          "desc": "Focus on bold, technically feasible ideas that add high user value and differentiation."},
@@ -81,10 +451,21 @@ def cmd_brainstorm(args: str, state, config) -> bool:
     claude_content = claude_md.read_text("utf-8", errors="replace") if claude_md.exists() else ""
     project_files = "\n".join([f.name for f in Path(".").glob("*") if f.is_file() and not f.name.startswith(".")])
 
-    user_topic = args.strip() or "general project improvement and architectural evolution"
+    # Pull optional flags before treating the remainder as topic.
+    # `--models a,b,c` distributes models round-robin across personas.
+    # `--lead <model>` picks who runs the moderator role (opening, probes,
+    # synthesis). `--rounds N` controls how many times each persona speaks
+    # — round 1 is initial positions, round 2+ are critique/revise. All
+    # default sensibly when omitted.
+    rounds_override, args_remaining = _parse_rounds_flag(args)
+    lead_model_override, args_remaining = _parse_lead_flag(args_remaining)
+    persona_models, args_remaining = _parse_models_flag(args_remaining)
+    user_topic = args_remaining.strip() or "general project improvement and architectural evolution"
 
     if _is_in_tg_turn(config) or _is_in_web_turn(config):
+        # No interactive prompts in bridge / web mode — pick safe defaults.
         agent_count = 5
+        n_rounds = rounds_override if rounds_override is not None else 2
     else:
         try:
             ans = ask_input_interactive(clr("  How many agents? (2-100, default 5) > ", "cyan"), config).strip()
@@ -92,6 +473,21 @@ def cmd_brainstorm(args: str, state, config) -> bool:
             agent_count = max(2, min(agent_count, 100))
         except (ValueError, KeyboardInterrupt, EOFError):
             agent_count = 5
+        # Rounds prompt — only when --rounds was NOT passed via args.
+        # 1 = monologues (one shot per persona), 2 = initial + critique
+        # (recommended default), 3+ = converges harder but costs more.
+        if rounds_override is not None:
+            n_rounds = rounds_override
+        else:
+            try:
+                rans = ask_input_interactive(
+                    clr("  Rounds [1=monologues, 2=critique (default), 3-6=more debate] > ", "cyan"),
+                    config,
+                ).strip()
+                n_rounds = int(rans) if rans else 2
+                n_rounds = max(1, min(n_rounds, 6))
+            except (ValueError, KeyboardInterrupt, EOFError):
+                n_rounds = 2
 
     snapshot = f"""PROJECT CONTEXT:
 README:
@@ -113,82 +509,377 @@ USER FOCUS: {user_topic}
         info(clr("(persona generation failed, using default tech personas)", "dim"))
         personas = dict(list(_TECH_PERSONAS.items())[:agent_count])
 
-    def get_identity(letter):
+    def _make_identity(letter: str) -> tuple[str, str]:
+        """Build (letter, name) for one persona. Faker is preferred but falls
+        back to a small hand-picked pool if the package is missing."""
         try:
             from faker import Faker
-            fake = Faker()
-            return f"{letter}", fake.name()
+            return letter, Faker().name()
         except Exception:
             import random
             first = ["Alex", "Sam", "Taylor", "Jordan", "Casey", "Riley", "Drew", "Avery"]
             last = ["Garcia", "Martinez", "Lopez", "Hernandez", "Gonzalez", "Sanchez", "Ramirez", "Torres"]
-            return f"{letter}", f"{random.choice(first)} {random.choice(last)}"
+            return letter, f"{random.choice(first)} {random.choice(last)}"
+
+    # Pre-assign a stable (letter, name) for each persona ONCE, by the
+    # persona's index in `personas`. Two prior bugs this kills:
+    #   (1) `persona_name[0].upper()` for letter — every persona key was
+    #       `p1/p2/…` so every Agent ended up labeled `P`, breaking the
+    #       cross-examination's clarity (`Agent P quoting Agent P attacking
+    #       Agent P`). Letters are now A, B, C, … (capped at Z if you ever
+    #       need >26 personas, which is extreme).
+    #   (2) `get_identity` was re-rolled every persona invocation, so the
+    #       SAME persona's "name" changed across rounds (round 1 = Riley
+    #       Torres, round 2 defense = Alex Lopez, round 3 = Taylor Gonzalez
+    #       — all the same agent). That made the transcript impossible to
+    #       follow. Identity is now sealed before the rounds loop.
+    _persona_keys = list(personas.keys())
+    _LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    persona_identity: dict[str, tuple[str, str]] = {
+        k: _make_identity(_LETTERS[i] if i < len(_LETTERS) else f"X{i+1}")
+        for i, k in enumerate(_persona_keys)
+    }
 
     outputs_dir = Path("brainstorm_outputs")
     outputs_dir.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_file = outputs_dir / f"brainstorm_{ts}.md"
 
+    # Lead model defaults to the current session model unless --lead overrode.
+    lead_model = lead_model_override or curr_model
+
     brainstorm_history = []
     ok(f"Starting {agent_count}-Agent Brainstorming Session on: {clr(user_topic, 'bold')}")
+    if persona_models:
+        info(clr(f"Multi-model debate across: {', '.join(persona_models)}", "dim"))
+    if lead_model != curr_model:
+        info(clr(f"Lead moderator: {lead_model}", "dim"))
+
+    # Heads-up if the lead model is in a known weak family — the lead
+    # role (opening / probes / synthesis) carries most of the quality
+    # weight; a weak lead leaves the personas un-moderated and the
+    # synthesis flat. We never override silently — just inform.
+    if _is_weak_lead_model(lead_model):
+        warn(
+            f"  Lead model `{lead_model}` is a small/weak family — "
+            f"opening + probes + synthesis quality will suffer."
+        )
+        info(clr(
+            "  Tip: pass `--lead claude-opus-4-7` (or any strong model) "
+            "to keep weak personas but get a strong moderator. "
+            "Free option: `--lead nim/deepseek-ai/deepseek-r1` "
+            "(NIM free tier, no payment).",
+            "dim",
+        ))
+
+    # ── Stage 1: Lead opening — set the agenda + reject filler. ──────────
+    info(clr("Lead moderator framing the debate...", "dim"))
+    _start_tool_spinner()
+    lead_opening = _lead_opening(user_topic, snapshot, lead_model, config)
+    _stop_tool_spinner()
+    if lead_opening:
+        print(clr("  └─ Anchor set.", "dim"))
+    else:
+        info(clr("  (lead opening failed — personas will run without an anchor)", "dim"))
+
     info(clr("Generating diverse perspectives...", "dim"))
 
-    def call_persona(persona_name, p_data, history):
-        letter, name = get_identity(persona_name[0].upper())
+    def _model_for_index(i: int) -> str:
+        """Round-robin model assignment across personas. Falls back to the
+        session's current model when no `--models` was given."""
+        if persona_models:
+            return persona_models[i % len(persona_models)]
+        return curr_model
+
+    def call_persona(persona_name, p_data, history, persona_model: str,
+                     anchor: str, round_num: int = 1, total_rounds: int = 1,
+                     follow_up: str = ""):
+        # Pull the pre-assigned, stable (letter, name) for this persona.
+        # Sealed once before the rounds loop — see persona_identity above.
+        letter, name = persona_identity[persona_name]
+        anchor_block = (
+            f"\nDEBATE ANCHOR (set by the lead moderator — adhere to this):\n{anchor}\n"
+            if anchor else ""
+        )
+
+        # Round-aware instructions. Round 1 is "stake your position";
+        # round 2+ is "engage with what others said, do NOT repeat".
+        # Without this distinction, multi-round just produces N copies
+        # of each persona's first take, which is not a brainstorm.
+        if round_num == 1:
+            instructions = (
+                "1. Provide 3-5 concrete, actionable insights or ideas from "
+                "your expert perspective on the topic. Adhere to the debate "
+                "anchor — concrete artifacts only, no filler.\n"
+                "2. If there are prior ideas from other agents in this round, "
+                "briefly acknowledge them and build upon or challenge them.\n"
+                "3. Be specific, well-reasoned, and professional. Stay in "
+                "character as your role.\n"
+                f"4. Prefix each of your points with: [Agent {letter} — {name}]\n"
+                "5. Output your response in clean Markdown."
+            )
+        else:
+            instructions = (
+                f"This is ROUND {round_num} of {total_rounds} — an "
+                "**ADVERSARIAL CROSS-EXAMINATION** round. You are NOT here "
+                "to politely reinforce other agents. You are here to find "
+                "the WEAKEST CLAIM made by someone else and ATTACK it.\n\n"
+                "MANDATORY (failure to do all of these = wasted round):\n\n"
+                "1. **Quote a specific claim from another agent VERBATIM** "
+                "(not yourself, not a summary — pick one named claim with a "
+                "specific noun in it: a ticker, a number, a file path, a "
+                "command). Identify them by letter, e.g. "
+                "`Agent A claimed: \"...\"`.\n"
+                "2. **Attack at least ONE specific weakness** in that claim. "
+                "Pick from:\n"
+                "   - Their data is wrong / outdated / misinterpreted\n"
+                "   - Their proposed mechanism doesn't produce the outcome "
+                "they predict\n"
+                "   - There's a confounder, contrary case, or base rate they "
+                "ignored\n"
+                "   - The claim is too vague to be tested or falsified\n"
+                "   - The claim contradicts a stronger claim already in the "
+                "debate (cite which one)\n"
+                "3. **Propose a falsifiable counter-claim** with at least one "
+                "specific (a number, a date, a named entity, a measurable "
+                "outcome that would prove you wrong if it didn't happen).\n"
+                "4. (Optional) Defend your own round-1 position against any "
+                "attacks already lodged against you — but this counts SEPARATELY "
+                "from the required challenge above. You can't skip the "
+                "challenge by only defending yourself.\n\n"
+                "FORMAT — use this exact structure for each challenge:\n"
+                "```\n"
+                "### [CHALLENGE → Agent X]\n"
+                "> \"<quoted claim from Agent X, verbatim or near-verbatim>\"\n"
+                "**Why this fails:** <one or two sentences with the specific weakness>\n"
+                "**Counter:** <your falsifiable counter-claim with a specific number/name/date>\n"
+                "```\n\n"
+                "FORBIDDEN: \"great point\", \"I agree, and would add\", "
+                "\"building on what Agent X said\", restating someone's claim "
+                "without attacking it, vague approval, asking the user to "
+                "decide. Synthesis is the LEAD's job in the final stage — "
+                "your job in this round is to stress-test.\n\n"
+                f"Prefix any defense-of-your-own-position section with: "
+                f"[Agent {letter} — {name}, round {round_num} defense]\n\n"
+                "Total response: 8-15 lines. Concise, specific, adversarial."
+            )
+
         system_prompt = f"""You are {name}, the {p_data['role']}. Identity: Agent {letter}.
 {p_data['desc']}
 
 TOPIC UNDER DISCUSSION: {user_topic}
-
+{anchor_block}
 PROJECT CONTEXT (if relevant to the topic):
 {snapshot}
 
 INSTRUCTIONS:
-1. Provide 3-5 concrete, actionable insights or ideas from your expert perspective on the topic.
-2. If there are prior ideas from other agents, briefly acknowledge them and build upon or challenge them.
-3. Be specific, well-reasoned, and professional. Stay in character as your role.
-4. Prefix each of your points with: [Agent {letter} — {name}]
-5. Output your response in clean Markdown.
+{instructions}
 """
-        user_msg = f"TOPIC: {user_topic}\n\nPRIOR IDEAS FROM DEBATE:\n{history or 'No previous ideas yet. You are the first to speak.'}"
+        if follow_up:
+            user_msg = (
+                f"TOPIC: {user_topic}\n\n"
+                f"PRIOR DEBATE:\n{history}\n\n"
+                f"FOLLOW-UP FROM LEAD MODERATOR (you must answer this directly, in 4-8 lines, with the specifics it asks for):\n{follow_up}"
+            )
+        elif round_num == 1:
+            user_msg = (
+                f"TOPIC: {user_topic}\n\n"
+                f"PRIOR IDEAS FROM DEBATE:\n{history or 'No previous ideas yet. You are the first to speak.'}"
+            )
+        else:
+            user_msg = (
+                f"TOPIC: {user_topic}\n\n"
+                f"FULL PRIOR DEBATE (rounds 1..{round_num - 1} — do NOT repeat any of this; engage with it):\n{history}"
+            )
         full_response = []
         internal_config = config.copy()
         internal_config["no_tools"] = True
         try:
-            for event in stream(curr_model, system_prompt, [{"role": "user", "content": user_msg}], [], internal_config):
+            for event in stream(persona_model, system_prompt, [{"role": "user", "content": user_msg}], [], internal_config):
                 if isinstance(event, TextChunk):
                     full_response.append(event.text)
         except Exception as e:
-            return f"Error from Agent {letter}: {e}"
+            return f"Error from Agent {letter} (model {persona_model}): {e}"
         return "".join(full_response).strip()
 
-    full_log = [f"# Brainstorming Session: {user_topic}", f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}", f"**Model:** {curr_model}", "---"]
+    if persona_models:
+        _model_summary = ", ".join(persona_models)
+    else:
+        _model_summary = curr_model
+    full_log = [
+        f"# Brainstorming Session: {user_topic}",
+        f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"**Personas via:** {_model_summary}",
+        f"**Lead moderator:** {lead_model}",
+        f"**Rounds:** {n_rounds}",
+        "---",
+    ]
+    if lead_opening:
+        full_log.append(f"## 🎯 Lead Opening\n{lead_opening}")
 
-    for p_name, p_data in personas.items():
-        icon = p_data.get("icon", "🤖")
-        info(f"{icon} {clr(p_data['role'], 'yellow')} is thinking...")
-        _start_tool_spinner()
-        hist_text = "\n\n".join(brainstorm_history) if brainstorm_history else ""
-        content = call_persona(p_name, p_data, hist_text)
-        _stop_tool_spinner()
-        if content:
+    # ── Stage 2: Personas — N rounds of debate. ──────────────────────────
+    # Round 1 = initial positions. Round 2+ = explicit critique/revise:
+    # personas see the full prior transcript and are required to engage
+    # with what others said (the round-aware prompt in call_persona
+    # enforces this). Lead probe may run after each persona in any round.
+    for round_num in range(1, n_rounds + 1):
+        if n_rounds > 1:
+            label = (
+                "initial positions" if round_num == 1
+                else "adversarial cross-examination — agents must attack each other's claims"
+            )
+            print(clr(f"\n  ── Round {round_num}/{n_rounds} ({label}) ──", "cyan"))
+            full_log.append(f"\n---\n### Round {round_num}/{n_rounds}")
+
+        for i, (p_name, p_data) in enumerate(personas.items()):
+            icon = p_data.get("icon", "🤖")
+            p_model = _model_for_index(i)
+            # Pull from the pre-assigned identity map (A, B, C, …) — see
+            # persona_identity build at the top of this function. Don't use
+            # `p_name[0].upper()` — every persona dict key is `p1/p2/…` so
+            # that always returns 'P'.
+            letter = persona_identity[p_name][0]
+            label = (
+                f"{icon} {clr(p_data['role'], 'yellow')}"
+                + (f" ({clr(p_model, 'dim')})" if persona_models else "")
+            )
+            info(f"{label} is thinking..." if round_num == 1
+                 else f"{label} is responding to round {round_num - 1}...")
+            _start_tool_spinner()
+            hist_text = "\n\n".join(brainstorm_history) if brainstorm_history else ""
+            content = call_persona(p_name, p_data, hist_text, p_model, lead_opening,
+                                    round_num=round_num, total_rounds=n_rounds)
+            _stop_tool_spinner()
+            if not content:
+                err(f"  └─ Failed to capture {p_name} perspective.")
+                continue
+
+            # Anti-copy-paste: in round 2+, weak models (qwen2.5 + vLLM
+            # is the canonical case) sometimes spot the first persona's
+            # CHALLENGE block in history and clone it verbatim with maybe
+            # one word changed. Detect Jaccard similarity ≥ 0.7 against
+            # any prior CHALLENGE block in the transcript and force ONE
+            # regeneration with an explicit "pick a different target /
+            # different angle" nudge. If it's still redundant after the
+            # retry, accept it but flag it in the log so the synthesizer
+            # can ignore it.
+            if round_num >= 2:
+                redundant, sim = _is_redundant_challenge(content, brainstorm_history)
+                if redundant:
+                    info(clr(
+                        f"  └─ Lead flag: {p_data['role']}'s challenge is "
+                        f"~{int(sim * 100)}% identical to a prior one — "
+                        f"asking for a different angle.",
+                        "yellow",
+                    ))
+                    nudge = (
+                        f"Your previous attempt copied another agent's "
+                        f"CHALLENGE block almost verbatim ({int(sim * 100)}% "
+                        f"token overlap). That doesn't add anything to the "
+                        f"debate. Pick a DIFFERENT target persona this time — "
+                        f"and a DIFFERENT angle of attack. Specifically: do "
+                        f"NOT challenge any of the same claims that were "
+                        f"already attacked above; find a fresh weakness in "
+                        f"someone else's contribution."
+                    )
+                    _start_tool_spinner()
+                    retry = call_persona(p_name, p_data, hist_text, p_model,
+                                          lead_opening, round_num=round_num,
+                                          total_rounds=n_rounds, follow_up=nudge)
+                    _stop_tool_spinner()
+                    # Use the retry only if it's actually less redundant.
+                    if retry:
+                        retry_redundant, retry_sim = _is_redundant_challenge(
+                            retry, brainstorm_history)
+                        if not retry_redundant or retry_sim < sim:
+                            content = retry
+                            print(clr("  └─ Re-engaged on a different angle.", "dim"))
+                        else:
+                            content = (
+                                f"_[lead note: contribution flagged as "
+                                f"redundant — {int(retry_sim * 100)}% overlap "
+                                f"with prior challenge]_\n\n{retry}"
+                            )
+                            print(clr("  └─ Still redundant — kept with flag.", "yellow"))
+
             brainstorm_history.append(content)
-            full_log.append(f"## {icon} {p_data['role']}\n{content}")
-            print(clr("  └─ Perspective captured.", "dim"))
-        else:
-            err(f"  └─ Failed to capture {p_name} perspective.")
+            heading_suffix = "" if round_num == 1 else f" — round {round_num}"
+            full_log.append(f"## {icon} {p_data['role']}{heading_suffix} _(via {p_model})_\n{content}")
+            print(clr(
+                "  └─ Perspective captured." if round_num == 1
+                else "  └─ Engagement captured.", "dim",
+            ))
+
+            # Lead probe — gives the persona one more swing if vague (in
+            # round 1) or if they dodged the cross-examination (in round
+            # 2+, the probe demands an actual challenge to a named agent).
+            # Skipped on the very last round (no time for the persona to
+            # revise after the final round anyway).
+            if round_num < n_rounds:
+                _start_tool_spinner()
+                probe = _lead_probe(user_topic, p_data["role"], letter, content,
+                                     lead_model, config, round_num=round_num)
+                _stop_tool_spinner()
+                if probe:
+                    info(clr(f"  └─ Lead probe: {probe[:120]}", "yellow"))
+                    _start_tool_spinner()
+                    follow = call_persona(p_name, p_data, hist_text, p_model,
+                                           lead_opening, round_num=round_num,
+                                           total_rounds=n_rounds, follow_up=probe)
+                    _stop_tool_spinner()
+                    if follow:
+                        brainstorm_history.append(
+                            f"_(follow-up to lead probe, round {round_num})_\n{follow}"
+                        )
+                        full_log.append(
+                            f"### 🔍 Lead probe + Agent {letter} reply (round {round_num})\n"
+                            f"{probe}\n\n{follow}"
+                        )
+                        print(clr("  └─ Follow-up captured.", "dim"))
+
+    # ── Stage 3: Lead synthesis — done HERE (not via main agent). ────────
+    info(clr("Lead moderator producing final synthesis...", "dim"))
+    _start_tool_spinner()
+    # Pass the raw debate history (every persona turn + follow-up) directly,
+    # rather than slicing full_log by index — the index drifts every time
+    # the header layout changes.
+    transcript_for_synth = "\n\n".join(brainstorm_history)
+    lead_master_plan = _lead_synthesis(
+        user_topic, transcript_for_synth, lead_model, config,
+        opening=lead_opening,
+    )
+    _stop_tool_spinner()
+    if lead_master_plan:
+        full_log.append("---\n## 📋 Lead Synthesis — Master Plan\n" + lead_master_plan)
+        print(clr("  └─ Synthesis complete.", "dim"))
+    else:
+        warn("  └─ Lead synthesis failed — falling back to bare debate transcript.")
 
     final_output = "\n\n".join(full_log)
+    out_file_abs = out_file.resolve()
     out_file.write_text(final_output, encoding="utf-8")
-    ok(f"Brainstorming complete! Results saved to {clr(str(out_file), 'bold')}")
+    ok(f"Brainstorming complete! Results saved to {clr(str(out_file_abs), 'bold')}")
 
-    info(clr("Injecting debate results into current session for final analysis...", "dim"))
-    synthesis_prompt = f"""I have just completed a multi-agent brainstorming session regarding: '{user_topic}'.
-The full debate results have been saved to the file: {out_file}
+    # The TODO prompt INLINES the master plan, so the main agent does NOT
+    # need to Read the file — eliminates the duplicate-Read pattern that
+    # weak models (qwen2.5 etc.) were prone to. If the lead failed to
+    # produce a plan, fall back to telling the agent to read the file.
+    if lead_master_plan:
+        todo_payload = (
+            "I just ran a multi-persona brainstorming session moderated by a "
+            f"lead model. Here is the lead's final master plan for: '{user_topic}'.\n\n"
+            f"--- BEGIN MASTER PLAN ---\n{lead_master_plan}\n--- END MASTER PLAN ---\n\n"
+            "There is NOTHING to read — the plan is above, in your context. "
+            "Use the master plan above directly."
+        )
+    else:
+        todo_payload = (
+            f"A brainstorming session ran but the lead synthesis failed. "
+            f"Read {out_file_abs} (use this absolute path verbatim) and "
+            "produce a master plan from the raw debate."
+        )
 
-Please read that file, then analyze the diverse perspectives. Identify the strongest ideas, potential conflicts, and provide a synthesized 'Master Plan' with concrete phases. Be concise and actionable."""
-
-    return ("__brainstorm__", synthesis_prompt, str(out_file))
+    return ("__brainstorm__", todo_payload, str(out_file_abs))
 
 
 def _save_synthesis(state, out_file: str) -> None:

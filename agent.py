@@ -10,7 +10,7 @@ from typing import Generator
 from tool_registry import get_tool_schemas
 from tools import execute_tool
 import tools as _tools_init  # ensure built-in tools are registered on import
-from providers import stream, AssistantTurn, TextChunk, ThinkingChunk, detect_provider
+from providers import stream, AssistantTurn, TextChunk, ThinkingChunk, detect_provider, nim_next_model
 from compaction import maybe_compact, estimate_tokens, get_context_limit, compact_messages, sanitize_history
 import logging_utils as _log
 import quota as _quota
@@ -113,6 +113,18 @@ def run(
     # happens. Bounded to one shot per user message to prevent any loop.
     _nudges_remaining = 1 if _looks_like_investigation(user_message) else 0
 
+    # Read-only dedup: when the model fires the same Read/Glob/Grep/WebFetch/
+    # WebSearch call with identical args twice in this run(), short-circuit
+    # the second one. We still append a synthetic tool_result to history
+    # (the OpenAI/Anthropic format requires tool_calls ↔ tool_response
+    # pairing) but the result is a brief reminder telling the model the
+    # content is already in its context — and we suppress the UI yields
+    # so the user doesn't see `⚙ Read(…)` printed twice for the same file.
+    # Catches the qwen2.5 pattern where the same file gets Read in two
+    # consecutive turns, then the master plan gets echoed as text twice.
+    _readonly_sigs_seen: set[str] = set()
+    _READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "WebFetch", "WebSearch"}
+
     while True:
         if cancel_check and cancel_check():
             return
@@ -144,6 +156,13 @@ def run(
             yield TextChunk(f"\n[Quota exceeded — {qe.reason}]\n")
             break
 
+        # NIM-only: when build.nvidia.com rate-limits a model, cycle to
+        # the next free-tier model before consuming a regular retry. Capped
+        # at _NIM_FALLBACK_LIMIT total swaps per turn so a fully-throttled
+        # tier can't cause a busy loop.
+        _nim_fallbacks_used = 0
+        _NIM_FALLBACK_LIMIT = 3
+
         # Stream from provider — retry on ANY error (never crash the session)
         max_retries = 3
         for attempt in range(max_retries + 1):
@@ -173,8 +192,33 @@ def run(
                 return  # circuit manages its own cooldown — don't retry
 
             except Exception as e:
-                from error_classifier import classify as _classify_err
+                from error_classifier import classify as _classify_err, ErrorCategory as _ErrCat
                 cerr = _classify_err(e)
+
+                # NIM 429 cascade: swap to the next free-tier model before
+                # spending a retry slot. Doesn't increment `attempt` so a
+                # transient global throttle still gets the regular backoff
+                # path after _NIM_FALLBACK_LIMIT swaps.
+                if (cerr.category == _ErrCat.RATE_LIMIT
+                        and detect_provider(config.get("model", "")) == "nim"
+                        and config.get("nim_auto_fallback", True)
+                        and _nim_fallbacks_used < _NIM_FALLBACK_LIMIT):
+                    _old = config["model"]
+                    _new = nim_next_model(_old)
+                    if _new and _new != _old:
+                        config = {**config, "model": _new}
+                        _nim_fallbacks_used += 1
+                        _log.warn("nim_fallback",
+                                   session_id=session_id,
+                                   from_model=_old, to_model=_new,
+                                   used=_nim_fallbacks_used,
+                                   limit=_NIM_FALLBACK_LIMIT)
+                        yield TextChunk(
+                            f"\n[NIM rate-limited on {_old} — switching to "
+                            f"{_new} ({_nim_fallbacks_used}/"
+                            f"{_NIM_FALLBACK_LIMIT})]\n"
+                        )
+                        continue   # retry without consuming attempt budget
 
                 if attempt >= max_retries or not cerr.retryable:
                     _log.error("api_failed", session_id=session_id,
@@ -289,6 +333,37 @@ def run(
             })
             break
 
+        # Read-only dedup: walk the batch first, mark any read-only call
+        # whose (name, args) signature already fired in this run() as a
+        # short-circuit. The actual execution + UI yields will skip these,
+        # but a synthetic tool_result still gets appended to history so the
+        # OpenAI/Anthropic tool_calls ↔ tool_response pairing stays valid.
+        _redundant_tcs: dict[str, str] = {}   # tool_call id → reminder text
+        for tc in tool_calls:
+            if tc.get("name") not in _READ_ONLY_TOOLS:
+                continue
+            try:
+                _args_blob = _j_loop.dumps(tc.get("input", {}) or {},
+                                            sort_keys=True, default=str)
+            except Exception:
+                continue
+            _ro_sig = f"{tc['name']}:{_h_loop.md5(_args_blob.encode('utf-8','ignore')).hexdigest()}"
+            if _ro_sig in _readonly_sigs_seen:
+                _arg_summary = _args_blob[:120]
+                _redundant_tcs[tc["id"]] = (
+                    f"[deduped] You already called {tc['name']} with these "
+                    f"args earlier in this turn ({_arg_summary}). The result "
+                    f"is identical to your previous tool result — do not "
+                    f"re-call read-only tools, use the content already in "
+                    f"your context."
+                )
+                _log.info("readonly_dedup",
+                           session_id=session_id,
+                           tool=tc["name"],
+                           sig=_ro_sig)
+            else:
+                _readonly_sigs_seen.add(_ro_sig)
+
         # Check permissions first (must be sequential — may prompt user)
         permissions: dict[str, bool] = {}
         for tc in tool_calls:
@@ -302,12 +377,14 @@ def run(
                     permitted = req.granted
             permissions[tc["id"]] = permitted
 
-        # Determine which tools can run in parallel
+        # Determine which tools can run in parallel — but treat redundant
+        # read-only calls as "sequential" (and short-circuit during exec)
+        # so the dedup path always lands on a single, predictable code path.
         from tool_registry import get_tool as _get_tool
         parallel_batch = []
         sequential_batch = []
         for tc in tool_calls:
-            if not permissions[tc["id"]]:
+            if not permissions[tc["id"]] or tc["id"] in _redundant_tcs:
                 sequential_batch.append(tc)
                 continue
             tdef = _get_tool(tc["name"])
@@ -319,6 +396,12 @@ def run(
         def _exec_one(tc):
             """Execute a single tool call, return (tc, result, permitted)."""
             tid = tc["id"]
+            # Read-only dedup short-circuit: skip the actual execute_tool
+            # call, return the synthetic reminder as the tool result. Marked
+            # `permitted=True` so downstream loop-error counters don't treat
+            # it as a denial.
+            if tid in _redundant_tcs:
+                return tc, _redundant_tcs[tid], True
             permitted = permissions[tid]
             if not permitted:
                 if config.get("permission_mode") == "plan":
@@ -356,9 +439,14 @@ def run(
 
         # Run sequential batch one by one
         for tc in sequential_batch:
-            yield ToolStart(tc["name"], tc["input"])
-            _log.debug("tool_start", session_id=session_id,
-                       tool=tc["name"], input_keys=list(tc["input"].keys()))
+            if tc["id"] not in _redundant_tcs:
+                yield ToolStart(tc["name"], tc["input"])
+                _log.debug("tool_start", session_id=session_id,
+                           tool=tc["name"], input_keys=list(tc["input"].keys()))
+            else:
+                # Tell the user *something* happened, but tersely — don't
+                # repeat the full ⚙ Read(<long path>) line.
+                yield TextChunk(f"\n[deduped {tc['name']}: already in context]\n")
             tc, result, permitted = _exec_one(tc)
             _log.debug("tool_end", session_id=session_id,
                        tool=tc["name"], permitted=permitted,
@@ -368,7 +456,12 @@ def run(
         # Yield results and append to state in original order
         _all_errors = bool(results_ordered)
         for tc, result, permitted in results_ordered:
-            yield ToolEnd(tc["name"], result, permitted)
+            # Suppress the visible ToolEnd for deduped calls — the brief
+            # `[deduped ...]` line above is enough. The tool_result still
+            # gets appended to state.messages so the next API request has
+            # a valid tool_calls ↔ tool_response pairing.
+            if tc["id"] not in _redundant_tcs:
+                yield ToolEnd(tc["name"], result, permitted)
             state.messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],

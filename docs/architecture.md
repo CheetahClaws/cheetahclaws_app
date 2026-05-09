@@ -106,7 +106,7 @@ internal structure.
 | Package | What it owns |
 |---|---|
 | [`tools/`](../tools) | All built-in LLM-callable tools.  `tools/__init__.py` holds `TOOL_SCHEMAS`, calls `_register_builtins()`, and imports extension modules.  One file per category: `fs.py`, `shell.py`, `web.py`, `notebook.py`, `diagnostics.py`, `security.py`, `interaction.py`, plus optional `browser.py`, `email.py`, `files.py`. |
-| [`commands/`](../commands) | Slash-command handlers.  `core.py` (help/clear/context/cost/…), `config_cmd.py` (model/config/permissions), `session.py` (save/load/resume), `advanced.py` (brainstorm/worker/ssj/memory/agents/skills/mcp/plugin/tasks), `checkpoint_plan.py` (checkpoint/rewind/plan), `agent_cmd.py` (/agent), `monitor_cmd.py` (subscribe/monitor). |
+| [`commands/`](../commands) | Slash-command handlers.  `core.py` (help/clear/context/cost/…), `config_cmd.py` (model/config/permissions), `session.py` (save/load/resume), `advanced.py` (brainstorm/worker/ssj/memory/agents/skills/mcp/plugin/tasks — `/brainstorm` runs a lead-moderated multi-round adversarial debate; see [`docs/guides/brainstorm.md`](guides/brainstorm.md)), `checkpoint_plan.py` (checkpoint/rewind/plan), `agent_cmd.py` (/agent), `monitor_cmd.py` (subscribe/monitor). |
 | [`bridges/`](../bridges) | External messaging adapters: `telegram.py`, `wechat.py`, `slack.py`, plus shared `interactive_session.py` and `terminal_runner.py`. |
 | [`ui/`](../ui) | Terminal rendering — `input.py` (prompt_toolkit / readline), `render.py` (rich Markdown, ANSI helpers, spinners, status line). |
 | [`web/`](../web) | Optional self-hosted web UI (FastAPI-style — xterm.js frontend, SQLite session store, per-user auth).  Enabled by `[web]` extra. |
@@ -200,6 +200,11 @@ consume the event stream; nothing else drives the model.
    e. Stream from provider, retrying up to 3× on retryable errors:
         TextChunk / ThinkingChunk → yield to caller
         AssistantTurn             → capture
+        — On RATE_LIMIT for a NIM model AND `nim_auto_fallback=True`,
+          swap to the next model in the curated NIM chain
+          (`providers.nim_next_model`) without consuming a retry slot.
+          Capped at 3 swaps/turn so a fully-throttled tier can't busy-
+          loop; falls through to standard backoff after the cap.
    f. Record assistant turn in state.messages
    g. yield TurnDone(in_tokens, out_tokens)
    h. If no tool_calls:
@@ -211,7 +216,16 @@ consume the event stream; nothing else drives the model.
           always falls through to break. See `_looks_like_investigation`
           in agent.py.
         - otherwise: break (conversation turn complete)
-   i. Permission gate each tool_call (sequential — may prompt user)
+   i. Permission gate each tool_call (sequential — may prompt user).
+      For each read-only call (Read/Glob/Grep/WebFetch/WebSearch),
+      compute `(name, args)` signature; if already seen in this run(),
+      mark redundant — `_exec_one` short-circuits to a `[deduped]`
+      reminder and ToolStart/ToolEnd UI yields are suppressed (a
+      brief `[deduped X: already in context]` text marker is yielded
+      instead). The synthetic tool_result is still appended to
+      state.messages so OpenAI/Anthropic tool_calls ↔ tool_response
+      pairing stays valid. Write/Edit/Bash are NOT deduped (intentional
+      rewrites are common).
    j. Execute:
         - parallel batch for concurrent_safe tools when >1 in a turn
         - sequential batch for everything else
@@ -254,18 +268,31 @@ based on the model string:
 
 ```python
 # Illustrative (not exhaustive)
-"claude-opus-4-7"        → anthropic
-"gpt-5"                  → openai
-"gemini-3.1-pro-preview" → gemini
-"qwen/Qwen3-MAX"         → qwen
-"ollama/qwen2.5-coder"   → ollama  (explicit prefix)
-"custom/my-endpoint"     → custom
+"claude-opus-4-7"                 → anthropic
+"gpt-5"                           → openai
+"gemini-3.1-pro-preview"          → gemini
+"qwen/Qwen3-MAX"                  → qwen
+"ollama/qwen2.5-coder"            → ollama  (explicit prefix)
+"custom/my-endpoint"              → custom
+"nim/meta/llama-3.3-70b-instruct" → nim     (build.nvidia.com free tier)
 ```
 
 `stream(model, system, messages, tool_schemas, config) -> Generator`
 is the one entry point agent.py uses.  Internally it dispatches to
 `stream_anthropic()` (native SDK) or `stream_openai_compat()` (used by
 every OpenAI-compatible provider).
+
+**NIM 429 cascade.** The `nim` provider points at `build.nvidia.com`'s
+free OpenAI-compatible endpoint with a curated 10-model chain
+(deepseek-r1, llama-3.3-70b, qwen2.5-coder-32b, …).  When one model
+returns a rate-limit error, the agent loop calls
+`providers.nim_next_model()` and retries with the next model in the
+chain — no retry slot consumed.  Capped at 3 swaps per turn so a
+fully-throttled tier can't busy-loop; falls through to the regular
+exponential-backoff retry path after the cap.  Disabled by setting
+`config["nim_auto_fallback"] = False`.  Other providers (anthropic,
+openai, etc.) are not affected — the swap is gated by
+`detect_provider(model) == "nim"`.
 
 **Neutral message format** — the single internal contract agent.py,
 providers.py, compaction.py, and session_store.py all agree on:
