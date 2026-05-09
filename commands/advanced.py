@@ -20,6 +20,112 @@ from tools import _is_in_tg_turn, _is_in_web_turn
 # ── Brainstorm ─────────────────────────────────────────────────────────────
 
 
+def _parse_ground_flag(args: str) -> tuple[int, str]:
+    """Pull `--ground` (boolean) or `--ground=N` (top-N cap) out of `args`.
+
+    Returns (top_n_or_0, remaining):
+      - 0       — flag absent → grounding off
+      - 15      — `--ground` alone → fetch top 15 results
+      - N       — `--ground=N` → fetch top N (clamped to [3, 50])
+
+    Grounding fetches a real /research brief on the topic and inlines
+    the top results into the snapshot personas see. For data-hungry
+    topics (stocks, current events, recent news) this is the difference
+    between "personas hallucinate from training memory" and "personas
+    cite real sources". Costs 10-30s and one network round-trip per
+    source — see research/aggregator.py.
+    """
+    import re as _re_g
+    # Try `--ground=N` first
+    m = _re_g.search(r"--ground=(\d+)", args)
+    if m:
+        n = max(3, min(int(m.group(1)), 50))
+        remaining = (args[:m.start()] + args[m.end():]).strip()
+        return n, remaining
+    # Bare `--ground`
+    m = _re_g.search(r"(?:^|\s)--ground(?:\s|$)", args)
+    if m:
+        remaining = (args[:m.start()] + " " + args[m.end():]).strip()
+        return 15, remaining
+    return 0, args
+
+
+def _format_grounding_brief(brief, max_chars: int = 4000) -> str:
+    """Render a research Brief into a compact markdown block ready to
+    inline into a persona / lead system prompt.
+
+    Keeps top results by engagement_score, capped at max_chars total so
+    a 50-result brief doesn't blow the context window. Each entry is
+    `[N] (source · domain) Title — URL — snippet[:200]`. Returns empty
+    string if the brief has no usable results."""
+    if not brief or not brief.results:
+        return ""
+    sorted_results = sorted(
+        brief.results,
+        key=lambda r: getattr(r, "engagement_score", 0.0),
+        reverse=True,
+    )
+    lines: list[str] = []
+    char_budget = max_chars
+    for i, r in enumerate(sorted_results, start=1):
+        snippet = (r.snippet or "").strip().replace("\n", " ")[:200]
+        domain = getattr(r, "domain", "web")
+        entry = (
+            f"[{i}] ({r.source} · {domain}) **{r.title}**\n"
+            f"    {r.url}\n"
+            f"    {snippet}"
+        )
+        if len(entry) + 2 > char_budget:
+            break
+        lines.append(entry)
+        char_budget -= len(entry) + 2
+    if not lines:
+        return ""
+    n_kept = len(lines)
+    n_total = len(sorted_results)
+    header = f"### GROUNDING DATA (top {n_kept} of {n_total} results from /research)"
+    suffix = (
+        "\n\n_When you make a claim that this data supports or "
+        "contradicts, cite by `[N]`. If your claim is NOT supported by "
+        "any of these results, say so explicitly — do not invent figures._"
+    )
+    return header + "\n\n" + "\n\n".join(lines) + suffix
+
+
+def _fetch_grounding(topic: str, top_n: int, config: dict) -> str:
+    """Run a /research brief on `topic` and return the formatted
+    grounding markdown. Empty string on any failure (so a flaky network
+    or missing API keys doesn't break the brainstorm — we just degrade
+    to the no-grounding flow with a logged warning).
+
+    Uses the existing aggregator with a 12s per-source timeout and the
+    same 24h SQLite cache /research uses, so back-to-back runs on the
+    same topic are basically free.
+    """
+    try:
+        from research.aggregator import research as _research
+    except Exception as e:
+        warn(f"  Grounding skipped — research module unavailable: {e}")
+        return ""
+    try:
+        brief = _research(
+            topic=topic,
+            limit=max(8, top_n // 2),   # per-source cap
+            max_total_results=top_n,
+            synthesize=False,            # we don't need the LLM synthesis here
+            use_cache=True,
+            source_timeout=12.0,
+            config=config,
+        )
+    except Exception as e:
+        warn(f"  Grounding fetch failed — continuing without data ({type(e).__name__}: {str(e)[:120]})")
+        return ""
+    formatted = _format_grounding_brief(brief)
+    if not formatted:
+        warn("  Grounding returned no usable results — continuing without data.")
+    return formatted
+
+
 def _parse_rounds_flag(args: str) -> tuple[int | None, str]:
     """Pull `--rounds N` out of `args`, return (N_or_None, remaining).
 
@@ -185,11 +291,20 @@ def _lead_opening(topic: str, snapshot: str, lead_model: str, config: dict) -> s
         "and whether the experts ACTUALLY challenged each other instead "
         "of taking turns being polite."
     )
+    has_grounding = "### GROUNDING DATA" in (snapshot or "")
+    grounding_note = (
+        "\n\n**Real /research data is attached in the context above as a "
+        "`### GROUNDING DATA` block.** Anchor the debate to what the data "
+        "ACTUALLY shows — when you set the agenda, point experts at the "
+        "specific results numbered `[1]`, `[2]`, …, and forbid any claim "
+        "that contradicts the grounding data without citing it.\n"
+        if has_grounding else ""
+    )
     user = f"""TOPIC: {topic}
 
-PROJECT CONTEXT:
-{snapshot[:2000]}
-
+PROJECT CONTEXT (truncated):
+{snapshot[:3500]}
+{grounding_note}
 Your job NOW (the opening): write a tight 8-12 line briefing that the
 debate will be anchored to. The briefing MUST contain, in this order:
 
@@ -295,7 +410,8 @@ Do NOT explain your decision. Output exactly one of the two forms."""
 
 
 def _lead_synthesis(topic: str, transcript: str, lead_model: str,
-                    config: dict, opening: str = "") -> str:
+                    config: dict, opening: str = "",
+                    grounding: str = "") -> str:
     """Lead produces the final structured synthesis. NO tool calls
     needed — the entire transcript is in the prompt context. This is
     what replaces the old "main agent reads file then synthesizes"
@@ -318,10 +434,18 @@ def _lead_synthesis(topic: str, transcript: str, lead_model: str,
         f"every action you propose below must obey this):\n\n{opening}\n\n---\n\n"
         if opening else ""
     )
+    grounding_block = (
+        f"GROUNDING DATA (real /research results — every consensus claim "
+        f"and every action you write must trace to either one of these "
+        f"`[N]` results OR to specific persona claims in the transcript "
+        f"below; if a claim has no traceable source, DROP it):\n\n"
+        f"{grounding}\n\n---\n\n"
+        if grounding else ""
+    )
     user = f"""TOPIC: {topic}
 
-{opening_block}FULL DEBATE TRANSCRIPT (each section is one expert's
-contribution, in the order they spoke):
+{opening_block}{grounding_block}FULL DEBATE TRANSCRIPT (each section
+is one expert's contribution, in the order they spoke):
 
 {transcript}
 
@@ -333,7 +457,11 @@ A bulleted list of claims that ≥2 experts backed. For each bullet,
 end with `(backed by: A, C)` listing the agent letters. Each claim
 must be SPECIFIC — name what / how much / which file / which ticker.
 If experts only agreed at the abstract level ("we should diversify"),
-do NOT list that — drop it instead.
+do NOT list that — drop it instead.{
+    " Where a consensus claim is supported by the GROUNDING DATA, also "
+    "cite the relevant `[N]` after the agent letters."
+    if grounding else ""
+}
 
 ## Dissents
 Bullet list of claims where experts disagreed, each phrased as
@@ -454,18 +582,21 @@ def cmd_brainstorm(args: str, state, config) -> bool:
     # Pull optional flags before treating the remainder as topic.
     # `--models a,b,c` distributes models round-robin across personas.
     # `--lead <model>` picks who runs the moderator role (opening, probes,
-    # synthesis). `--rounds N` controls how many times each persona speaks
-    # — round 1 is initial positions, round 2+ are critique/revise. All
-    # default sensibly when omitted.
+    # synthesis). `--rounds N` controls how many times each persona speaks.
+    # `--ground` (or `--ground=N`) pre-fetches a /research brief and
+    # inlines top results so personas debate against real data instead
+    # of training-time priors.
     rounds_override, args_remaining = _parse_rounds_flag(args)
     lead_model_override, args_remaining = _parse_lead_flag(args_remaining)
     persona_models, args_remaining = _parse_models_flag(args_remaining)
+    ground_top_n, args_remaining = _parse_ground_flag(args_remaining)
     user_topic = args_remaining.strip() or "general project improvement and architectural evolution"
 
     if _is_in_tg_turn(config) or _is_in_web_turn(config):
         # No interactive prompts in bridge / web mode — pick safe defaults.
         agent_count = 5
         n_rounds = rounds_override if rounds_override is not None else 2
+        # Grounding stays at whatever --ground arg said (default off).
     else:
         try:
             ans = ask_input_interactive(clr("  How many agents? (2-100, default 5) > ", "cyan"), config).strip()
@@ -488,6 +619,35 @@ def cmd_brainstorm(args: str, state, config) -> bool:
                 n_rounds = max(1, min(n_rounds, 6))
             except (ValueError, KeyboardInterrupt, EOFError):
                 n_rounds = 2
+        # Grounding prompt — only when --ground was NOT passed via args.
+        # Default off because some topics don't need real-data grounding
+        # (architecture, refactor, design) and the fetch costs 10-30s.
+        if ground_top_n == 0:
+            try:
+                gans = ask_input_interactive(
+                    clr(
+                        "  Ground in /research data first? (recommended for "
+                        "stocks/news/current events) [y/N] > ",
+                        "cyan",
+                    ),
+                    config,
+                ).strip().lower()
+                if gans in ("y", "yes", "1", "true"):
+                    ground_top_n = 15
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+    # Optional grounding fetch — must happen BEFORE snapshot is built so
+    # personas / lead all see the same grounding data inline. Cheap when
+    # cached (24h SQLite) so re-runs on the same topic are basically free.
+    grounding_block = ""
+    if ground_top_n > 0:
+        info(clr(f"Fetching grounding data via /research (top {ground_top_n})...", "dim"))
+        _start_tool_spinner()
+        grounding_block = _fetch_grounding(user_topic, ground_top_n, config)
+        _stop_tool_spinner()
+        if grounding_block:
+            print(clr(f"  └─ Grounding attached ({len(grounding_block)} chars).", "dim"))
 
     snapshot = f"""PROJECT CONTEXT:
 README:
@@ -501,6 +661,8 @@ ROOT FILES:
 
 USER FOCUS: {user_topic}
 """
+    if grounding_block:
+        snapshot = grounding_block + "\n\n---\n\n" + snapshot
     curr_model = config["model"]
 
     info(clr(f"Generating {agent_count} topic-appropriate expert personas...", "dim"))
@@ -616,7 +778,13 @@ USER FOCUS: {user_topic}
                 "3. Be specific, well-reasoned, and professional. Stay in "
                 "character as your role.\n"
                 f"4. Prefix each of your points with: [Agent {letter} — {name}]\n"
-                "5. Output your response in clean Markdown."
+                "5. **If a `### GROUNDING DATA` section appears in your "
+                "context above, you MUST cite specific results by `[N]` "
+                "when your claim relates to one. If you make a claim that "
+                "the grounding data does NOT support, say so explicitly — "
+                "do not invent figures, prices, or statistics that don't "
+                "appear there.**\n"
+                "6. Output your response in clean Markdown."
             )
         else:
             instructions = (
@@ -847,6 +1015,7 @@ INSTRUCTIONS:
     lead_master_plan = _lead_synthesis(
         user_topic, transcript_for_synth, lead_model, config,
         opening=lead_opening,
+        grounding=grounding_block,
     )
     _stop_tool_spinner()
     if lead_master_plan:
