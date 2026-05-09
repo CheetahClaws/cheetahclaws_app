@@ -87,6 +87,23 @@ def _build_serve_parser() -> argparse.ArgumentParser:
     p.add_argument("--unauthenticated-metrics", action="store_true",
                    help="Serve /healthz, /readyz, /metrics without auth "
                         "(off by default; opt-in for Prometheus scrapers).")
+    # ── cc_kernel (RFC 0003) — opt-in only, default off. ──────────────────
+    # When absent, cc_kernel is never imported and the daemon behaviour is
+    # byte-for-byte identical to the pre-RFC build (existing users see no
+    # change). When present, kernel.db is opened, startup recovery runs,
+    # and the kernel.* RPC methods join the registry.
+    p.add_argument("--enable-kernel", action="store_true",
+                   help="Activate cc_kernel (RFC 0003: AgentProcess + EventLog). "
+                        "Off by default; existing users see no change.")
+    p.add_argument("--kernel-db", default=None,
+                   help="Path to kernel.db (default: <data-dir>/kernel.db). "
+                        "Only used with --enable-kernel.")
+    p.add_argument("--kernel-recovery", choices=("suspend", "mark-dead"),
+                   default="suspend",
+                   help="What to do with stale RUNNING/WAITING rows on "
+                        "startup. 'suspend' (default) is safe and "
+                        "reversible; 'mark-dead' is unconditional. "
+                        "Only used with --enable-kernel.")
     return p
 
 
@@ -178,6 +195,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
             token_path_for_discovery = str(token_file)
         if args.print_token:
             print(f"token: {token}", flush=True)
+
+    # ── cc_kernel activation (RFC 0003) — strictly opt-in. ───────────────
+    # Importing cc_kernel is gated on the flag so the no-flag default
+    # path imports nothing new and pays no startup cost.
+    if getattr(args, "enable_kernel", False):
+        kernel_db = Path(args.kernel_db).expanduser() if args.kernel_db \
+            else (data_dir / "kernel.db")
+        try:
+            from cc_kernel import register_with_daemon as _register_kernel
+            _register_kernel(
+                server.daemon_state, kernel_db,
+                recovery=args.kernel_recovery,
+            )
+        except Exception as exc:
+            # Failing to bring up the kernel must not silently downgrade
+            # the daemon; better to refuse to start than to lie about
+            # serving the kernel surface.
+            print(f"error: --enable-kernel: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            try:
+                server.server_close()
+            except Exception:
+                pass
+            return 3
 
     _write_pidfile(pid_file)
 

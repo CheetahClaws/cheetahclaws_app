@@ -70,6 +70,7 @@ py-modules = [
 include = [
     "tools*",
     "cc_daemon*",
+    "cc_kernel*",
     "cc_mcp*",
     "memory*",
     "monitor*",

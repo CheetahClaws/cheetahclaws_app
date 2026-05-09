@@ -510,42 +510,69 @@ def _register_builtins() -> None:
         ToolDef(
             name="Bash",
             schema=_schemas["Bash"],
-            func=lambda p, c: _bash(
-                p["command"], p.get("timeout", 30),
-                c.get("_worktree_cwd"),
-                c.get("shell_policy", "allow"),
-                c.get("_session_id", "default"),
+            func=lambda p, c: (
+                "Error: Bash requires a non-empty 'command' argument "
+                "(the shell command to run). Pass it like "
+                "{\"command\": \"ls -la\"}."
+                if not (isinstance(p.get("command"), str) and p["command"].strip())
+                else _bash(
+                    p["command"], p.get("timeout", 30),
+                    c.get("_worktree_cwd"),
+                    c.get("shell_policy", "allow"),
+                    c.get("_session_id", "default"),
+                )
             ),
             read_only=False, concurrent_safe=False,
         ),
         ToolDef(
             name="Glob",
             schema=_schemas["Glob"],
-            func=lambda p, c: _glob(p["pattern"], p.get("path"), c.get("_worktree_cwd")),
+            func=lambda p, c: (
+                "Error: Glob requires a non-empty 'pattern' argument "
+                "(e.g. \"**/*.py\")."
+                if not (isinstance(p.get("pattern"), str) and p["pattern"].strip())
+                else _glob(p["pattern"], p.get("path"), c.get("_worktree_cwd"))
+            ),
             read_only=True, concurrent_safe=True,
         ),
         ToolDef(
             name="Grep",
             schema=_schemas["Grep"],
-            func=lambda p, c: _grep(
-                p["pattern"], p.get("path"), p.get("glob"),
-                p.get("output_mode", "files_with_matches"),
-                p.get("case_insensitive", False),
-                p.get("context", 0),
-                c.get("_worktree_cwd"),
+            func=lambda p, c: (
+                "Error: Grep requires a non-empty 'pattern' argument "
+                "(the regex to search for)."
+                if not (isinstance(p.get("pattern"), str) and p["pattern"].strip())
+                else _grep(
+                    p["pattern"], p.get("path"), p.get("glob"),
+                    p.get("output_mode", "files_with_matches"),
+                    p.get("case_insensitive", False),
+                    p.get("context", 0),
+                    c.get("_worktree_cwd"),
+                )
             ),
             read_only=True, concurrent_safe=True,
         ),
         ToolDef(
             name="WebFetch",
             schema=_schemas["WebFetch"],
-            func=lambda p, c: _webfetch(p["url"], p.get("prompt")),
+            func=lambda p, c: (
+                _webfetch(p["url"], p.get("prompt"))
+                if isinstance(p.get("url"), str) and p["url"].strip()
+                else "Error: WebFetch requires a non-empty 'url' "
+                     "argument (the URL to fetch)."
+            ),
             read_only=True, concurrent_safe=True,
         ),
         ToolDef(
             name="WebSearch",
             schema=_schemas["WebSearch"],
-            func=lambda p, c: _websearch(p["query"]),
+            func=lambda p, c: (
+                _websearch(p["query"])
+                if isinstance(p.get("query"), str) and p["query"].strip()
+                else "Error: WebSearch requires a non-empty 'query' "
+                     "argument (the search string). Pass it like "
+                     "{\"query\": \"berkeley weather today\"}."
+            ),
             read_only=True, concurrent_safe=True,
         ),
         ToolDef(

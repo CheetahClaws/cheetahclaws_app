@@ -109,6 +109,17 @@ Use this package for snapshot policies, backup strategies, file restore behavior
 
 Use this package for STT backend changes, audio capture behavior, and prompt-boosting vocabulary logic.
 
+## Agent OS kernel (`cc_kernel/`)
+- `cc_kernel/api.py` — `Kernel.open(...)` facade: SQLite-backed substores for capability, ledger, scheduler, mailbox, registry, AgentFS, events.
+- `cc_kernel/contract.py` — frozen v1.0 RPC method registry (CI drift guard).
+- `cc_kernel/runner/supervisor.py` — subprocess agent spawn + JSON-line IPC + streaming chunk relay.
+- `cc_kernel/runner/llm/` — LLM agent runner (Anthropic + scripted-mock providers, multi-turn dialogue, tool-calling loop, token streaming).
+- `cc_kernel/tools/` — tool registry + dispatch; auto-registered (Echo, Read, Write, Glob, List, Diff, AST) and opt-in (Exec, Fetch, Git).
+- `cc_kernel/cli.py` — `cheetahclaws kernel <action>` subcommand (read-only inspection over the daemon RPC).
+- Activated only when daemon runs with `--enable-kernel`. Default REPL/bridges path is byte-for-byte unchanged.
+
+Use this package for agent isolation, capability/quota policy, scheduler tuning, AgentFS storage, sandbox primitives, or new built-in tools. Every behavioural change MUST land with an RFC under `docs/RFC/` (acceptance criteria + BC story); see [`docs/agent-os.md`](agent-os.md) for the index of all 27 shipped RFCs.
+
 ---
 
 ## 4) “I need to implement X” → where to edit
@@ -119,6 +130,15 @@ Use this package for STT backend changes, audio capture behavior, and prompt-boo
 3. Decide `read_only` and `concurrent_safe` correctly.
 4. If it mutates files/system, ensure permission behavior is correct in `agent.py` / `tools.execute_tool` wrapper.
 5. Add tests in `tests/test_tool_registry.py` and/or feature-specific tests.
+
+### Add a new kernel tool (under `--enable-kernel`)
+1. Write a one-page RFC under `docs/RFC/00NN-<name>-tool.md` (problem, args, capability/fs/net checks, output shape, BC story, acceptance criteria).
+2. Add `cc_kernel/tools/<name>_tool.py` with a `<NAME>_TOOL` `Tool` instance (fields: `name`, `description`, `handler`, `requires_capability`, `requires_fs`).
+3. Auto-register (zero-side-effect inspectors only) by adding to `cc_kernel/tools/builtin.py::register_builtin_tools` AND to its return list. Otherwise expose `register_<name>_tool(registry)` and document it as **opt-in**.
+4. Re-export from `cc_kernel/tools/__init__.py` `__all__`.
+5. Append the RFC number to `cc_kernel/contract.py::RFCS_IMPLEMENTED`.
+6. Add tests under `tests/test_kernel_<name>_tool.py` covering args validation, capability/fs gates, success path, and the acceptance criteria from the RFC.
+7. If the tool emits incremental output, route it through `ctx.on_chunk(payload)` so `Supervisor.wait(on_chunk=...)` callers see it (RFC 0028 substrate).
 
 ### Add a new slash command
 1. Add `cmd_<name>` function in `cheetahclaws.py`.

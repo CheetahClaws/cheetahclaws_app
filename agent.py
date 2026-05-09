@@ -94,6 +94,18 @@ def run(
     # Wire up structured logging from config (idempotent, cheap)
     _log.configure_from_config(config)
 
+    # Loop guard: defends against models that retry failing tool calls
+    # indefinitely (e.g. Gemma 4 31B looping on WebSearch+Bash whose
+    # args got eaten by the native tool-call parser). Two thresholds:
+    #   - same (name+args) repeated → break after `_LOOP_REPEAT_LIMIT`
+    #   - any tool returning Error/Denied N consecutive times → break
+    #     after `_LOOP_ERROR_LIMIT`, even across different tool names
+    _loop_last_call_sig: tuple | None = None
+    _loop_repeat_count = 0
+    _loop_consecutive_errors = 0
+    _LOOP_REPEAT_LIMIT = 3
+    _LOOP_ERROR_LIMIT  = 5
+
     while True:
         if cancel_check and cancel_check():
             return
@@ -211,6 +223,47 @@ def run(
         # ── Execute tools (parallel when safe) ────────────────────────────
         tool_calls = assistant_turn.tool_calls
 
+        # Loop guard: same tool_calls signature repeated N times → break.
+        # The model is stuck retrying without progress (typically because
+        # a tool result it can't parse came back, or its tool-call arg
+        # parser keeps emitting the same malformed payload).
+        import hashlib as _h_loop
+        import json as _j_loop
+        _sig = tuple(
+            (tc.get("name", ""),
+             _h_loop.md5(
+                 _j_loop.dumps(tc.get("input", {}) or {},
+                                sort_keys=True, default=str).encode(
+                     "utf-8", "ignore"),
+             ).hexdigest())
+            for tc in tool_calls
+        )
+        if _sig == _loop_last_call_sig:
+            _loop_repeat_count += 1
+        else:
+            _loop_last_call_sig = _sig
+            _loop_repeat_count = 1
+        if _loop_repeat_count >= _LOOP_REPEAT_LIMIT:
+            _names = ", ".join(sorted({tc.get("name", "?")
+                                         for tc in tool_calls}))
+            _loop_msg = (
+                f"\n[Loop guard] Same tool call repeated "
+                f"{_LOOP_REPEAT_LIMIT} times — stopping to prevent a "
+                f"runaway loop. The model kept calling {_names} with "
+                f"identical args without making progress. Try /clear "
+                f"and rephrase your request, or switch to a more "
+                f"capable model.\n"
+            )
+            _log.warn("loop_guard_triggered",
+                       session_id=session_id,
+                       tools=_names,
+                       repeats=_loop_repeat_count)
+            yield TextChunk(_loop_msg)
+            state.messages.append({
+                "role": "assistant", "content": _loop_msg.strip(),
+            })
+            break
+
         # Check permissions first (must be sequential — may prompt user)
         permissions: dict[str, bool] = {}
         for tc in tool_calls:
@@ -288,6 +341,7 @@ def run(
             results_ordered.append((tc, result, permitted))
 
         # Yield results and append to state in original order
+        _all_errors = bool(results_ordered)
         for tc, result, permitted in results_ordered:
             yield ToolEnd(tc["name"], result, permitted)
             state.messages.append({
@@ -296,6 +350,40 @@ def run(
                 "name":         tc["name"],
                 "content":      result,
             })
+            # Loop guard: track whether this batch was all errors.
+            res_str = result if isinstance(result, str) else str(result)
+            res_low = res_str.lstrip()[:24].lower()
+            if not (res_low.startswith("error")
+                    or res_low.startswith("denied")
+                    or "keyerror" in res_low):
+                _all_errors = False
+
+        # Loop guard: cross-tool consecutive-error counter — break if
+        # the model keeps invoking tools that all fail (e.g. cycling
+        # between empty-args WebSearch and empty-args Bash).
+        if _all_errors:
+            _loop_consecutive_errors += len(results_ordered)
+        else:
+            _loop_consecutive_errors = 0
+        if _loop_consecutive_errors >= _LOOP_ERROR_LIMIT:
+            _err_msg = (
+                f"\n[Loop guard] {_loop_consecutive_errors} consecutive "
+                f"tool calls returned errors — stopping to prevent a "
+                f"runaway loop. Likely cause: the model is emitting "
+                f"tool calls without valid args (Gemma 4 + vLLM "
+                f"hermes parser is a known offender). Try /clear and "
+                f"rephrase, or switch to a model with native "
+                f"function-calling support (claude-*, gpt-*, "
+                f"deepseek-*).\n"
+            )
+            _log.warn("loop_guard_consecutive_errors_triggered",
+                       session_id=session_id,
+                       count=_loop_consecutive_errors)
+            yield TextChunk(_err_msg)
+            state.messages.append({
+                "role": "assistant", "content": _err_msg.strip(),
+            })
+            break
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────

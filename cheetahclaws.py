@@ -1628,6 +1628,13 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "daemon":
         from commands.daemon_cmd import dispatch as _daemon_dispatch
         sys.exit(_daemon_dispatch(sys.argv[2:]))
+    # Read-only kernel inspection (RFC 0003+ surface). Talks to a
+    # running `cheetahclaws serve --enable-kernel` daemon over the
+    # existing daemon RPC channel; gracefully reports "not running"
+    # when the daemon is absent.
+    if len(sys.argv) >= 2 and sys.argv[1] == "kernel":
+        from cc_kernel.cli import dispatch as _kernel_dispatch
+        sys.exit(_kernel_dispatch(sys.argv[2:]))
     # Backward-compat alias for the spike's `cheetahclaws spike-daemon ...`
     # surface (referenced in docs/RFC/0001-spike-notes.md).  Routes through
     # the same paths as `serve` / `daemon <action>` so spike-notes commands

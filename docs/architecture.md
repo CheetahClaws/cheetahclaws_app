@@ -892,6 +892,106 @@ keeps firing on schedule, reports persist to SQLite, SSE clients see
 each digest as it lands, history is `monitor.list_reports("arxiv")`
 away when the user reconnects.
 
+### Agent OS kernel (`cc_kernel/`)
+
+Layer above the daemon and below the user-facing CLI/REPL/bridges.
+Turns cheetahclaws into a true single-node agent operating system:
+process table, capability model, quota ledger, scheduler, mailbox/
+registry, virtual filesystem, observability, and a frozen 58-method
+JSON-RPC contract — backed by a single SQLite WAL-mode database
+(`kernel.db`).
+
+Activated at runtime by `cheetahclaws serve --enable-kernel`.
+Without that flag the kernel code is dormant and the legacy
+single-process REPL/bridge path is byte-for-byte unchanged. Full
+overview at [`docs/agent-os.md`](agent-os.md).
+
+**Module map.**
+
+- `cc_kernel/api.py` — `Kernel` facade. `Kernel.open(...)` opens a
+  WAL-mode SQLite store and exposes the `cap` / `ledger` / `sched` /
+  `mbox` / `registry` / `fs` / `events` substores. `make_supervisor()`
+  constructs a `Supervisor` ready to spawn subprocess agents.
+- `cc_kernel/store.py` + `cc_kernel/schema.py` — single-connection
+  store with forward-only migrations (v1 → v7); a `write_lock`
+  serializes mutations across substores.
+- `cc_kernel/capability.py` (RFC 0005) — `tool_grants` / `fs_grants`
+  / `net_grants` / `model_grants` / `sub_agent` capability bag with
+  `derive(...)` for sub-agent attenuation.
+- `cc_kernel/ledger.py` (RFC 0006) — per-agent ResourceLedger with
+  atomic `charge` + `first_breach` signal so the scheduler can
+  shed load without polling.
+- `cc_kernel/scheduler.py` (RFC 0007) — priority queue +
+  admission filter (consults ledger before claim).
+- `cc_kernel/mailbox.py` (RFC 0009) — direct + topic pub/sub
+  with at-least-once delivery semantics.
+- `cc_kernel/registry.py` (RFC 0010) — name → pid lookup for
+  service discovery.
+- `cc_kernel/agent_fs.py` (RFC 0011) — VFS unifying memory /
+  checkpoint / skill / task storage.
+- `cc_kernel/sandbox.py` (RFC 0008) — RLIMIT (CPU/AS/FSIZE/
+  NOFILE) preexec_fn + optional bubblewrap wrapper +
+  wall-clock killer thread + `new_session` (own process group).
+- `cc_kernel/contract.py` (RFC 0013) — frozen v1.0 method
+  registry; CI drift guard fails the build if a registered
+  RPC method isn't classified `stable`/`experimental`/
+  `deprecated`.
+- `cc_kernel/cli.py` — `cheetahclaws kernel <action>` subcommand
+  for read-only inspection over the daemon's RPC: `summary`,
+  `info`, `agents`, `proc <pid>`, `events`, `queue`, `registry`,
+  `methods`, `prometheus`.
+- `cc_kernel/runner/supervisor.py` (RFC 0016/0017) — spawns
+  subprocess agents with a JSON-line IPC channel
+  (`runner/ipc.py`); processes `init` / `ready` / `tool_call`
+  / `chunk` / `iteration_done` / `exit` messages; integrates
+  the streaming-chunk substrate (RFC 0026) so callers can
+  subscribe to incremental output via `wait(pid,
+  on_chunk=...)`.
+- `cc_kernel/runner/llm/` (RFC 0019/0020/0022/0027) — LLM
+  agent runner. Provider protocol (callable returning
+  `LlmResponse` + optional `stream(req, on_delta)`); Anthropic
+  + scripted-mock adapters; multi-iteration tool-calling loop
+  with per-iter chunk emission; multi-turn dialogue
+  orchestrator.
+- `cc_kernel/runner/bridge_mirror/` (RFC 0018) — mirrors
+  bridges' inbound/outbound messages into `kernel.mbox` and
+  back without touching `bridges/` source files (BC
+  constraint).
+- `cc_kernel/tools/` — tool registry + dispatch + handlers.
+  Auto-registered: `Echo`, `Read`, `Write`, `Glob`, `List`,
+  `Diff`, `AST`. Opt-in (operator must call
+  `register_<tool>`): `Exec`, `Fetch`, `Git` — each with its
+  own threat model documented in the relevant RFC.
+
+**Streaming.** Three layers feed a single `on_chunk(payload)`
+sink:
+
+- **LLM** (RFC 0027): provider's `stream(req, on_delta)` emits
+  per-token text deltas → runner forwards via `op="chunk"`.
+- **Exec** (RFC 0028): Popen + queue-serialized reader threads
+  emit per-line stdout/stderr through `ToolContext.on_chunk`.
+- **Fetch** (RFC 0029): terminal-hop body chunks per 8 KB
+  read.
+
+`Supervisor.wait(...)` accumulates all chunks in
+`RunnerExitInfo.chunks` and forwards to the user's callback in
+arrival order; bad callbacks are caught at the boundary so they
+can't break the wait loop.
+
+**Backwards compatibility.** All surface in `cc_kernel/` is
+isolated; the only edits outside the package are one-line opt-in
+hooks in `cheetahclaws.py` (the `cheetahclaws kernel ...`
+subcommand dispatcher). Schema is forward-only — old `kernel.db`
+files upgrade in place. The 58-method contract is frozen at
+v1.0 with CI drift guard.
+
+**Where to next.** Two RFCs remain explicitly parked: **RFC 0014
+multi-tenant** (only worth doing if cheetahclaws is deployed as
+team SaaS) and **RFC 0015 cluster** (only worth doing once a
+single host saturates). Higher-ROI follow-ups: tag a v1.x release
++ CHANGELOG, integration performance tests under real LLM
+workload, operator documentation for `--enable-kernel` deployment.
+
 ### Research Lab (`research/lab/` + `commands/lab_cmd.py` + `web/lab_*`)
 
 Autonomous multi-agent research engine — `/lab start <topic>` (CLI)

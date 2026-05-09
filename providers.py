@@ -22,6 +22,8 @@ Model string formats:
 """
 from __future__ import annotations
 import json
+import os
+import time
 import urllib.request
 from typing import Generator
 
@@ -452,6 +454,83 @@ def _extract_native_tool_calls(buf: str) -> list[dict]:
     return out
 
 
+# Format 3: Gemma 4 channel-tagged tool intent — surfaced in streamed
+# text when vLLM's hermes parser ate the `<|tool_call|>` opener but
+# left fragments behind. Patterns we've seen in the wild:
+#   `<|channel|>commentary to=WebSearch <|message|>{"query":"x"}<|im_end|>`
+#   `<|channel|>commentary tool=WebSearch <|message|>{...}<|im_end|>`
+#   `<|channel|>thought<|channel|> ... call:WebSearch{"query":"x"}`
+_GEMMA_CHANNEL_RE = _re_native.compile(
+    r"<\|?channel\|?>\s*\w+\s+(?:to|tool|name)\s*=\s*(\w+)\s*"
+    r"<\|?message\|?>\s*(\{.*?\})",
+    _re_native.DOTALL,
+)
+_GEMMA_LOOSE_CALL_RE = _re_native.compile(
+    r"\bcall\s*:\s*(\w+)\s*(\{.*?\})",
+    _re_native.DOTALL,
+)
+# Asymmetric Gemma 4 form without `call:` prefix:
+#   `<|tool_call>WebSearch{"query":"x"}<tool_call|>`
+_GEMMA_INLINE_NAME_RE = _re_native.compile(
+    r"<\|?tool_call\|?>\s*(\w+)\s*(\{.*?\})\s*<\|?(?:end_)?(?:/)?tool_call\|?>",
+    _re_native.DOTALL,
+)
+
+
+def _recover_args_from_text(text: str, tool_name: str) -> dict | None:
+    """Last-ditch recovery: when vLLM emits a tool_call with name but
+    empty arguments, scan the surrounding streamed text for the
+    matching Gemma-style channel/message or `call:NAME{json}` pair
+    and return parsed args. Returns None if nothing recoverable.
+
+    Used only when the primary parse path produced empty `input`.
+    """
+    if not text or not tool_name:
+        return None
+
+    for tok, repl in _GEMMA_QUOTE_TOKEN_FIXES:
+        text = text.replace(tok, repl)
+
+    # Try channel-tagged form first.
+    for m in _GEMMA_CHANNEL_RE.finditer(text):
+        if m.group(1) == tool_name:
+            try:
+                args = json.loads(m.group(2))
+                if isinstance(args, dict) and args:
+                    return args
+            except json.JSONDecodeError:
+                continue
+
+    # Try loose `call:NAME{json}` form.
+    for m in _GEMMA_LOOSE_CALL_RE.finditer(text):
+        if m.group(1) == tool_name:
+            try:
+                args = json.loads(m.group(2))
+                if isinstance(args, dict) and args:
+                    return args
+            except json.JSONDecodeError:
+                continue
+
+    # Try asymmetric inline-name form: `<|tool_call>NAME{json}<tool_call|>`.
+    for m in _GEMMA_INLINE_NAME_RE.finditer(text):
+        if m.group(1) == tool_name:
+            try:
+                args = json.loads(m.group(2))
+                if isinstance(args, dict) and args:
+                    return args
+            except json.JSONDecodeError:
+                continue
+
+    # Try the native-format extractors (handles `<|tool_call|>...`).
+    native = _extract_native_tool_calls(text)
+    for nc in native:
+        if nc.get("name") == tool_name and nc.get("input"):
+            inp = nc["input"]
+            if isinstance(inp, dict) and inp and "_raw" not in inp:
+                return inp
+    return None
+
+
 # ── Tool schema conversion ─────────────────────────────────────────────────
 
 def tools_to_openai(tool_schemas: list) -> list:
@@ -789,6 +868,19 @@ def stream_openai_compat(
     native_tool_buffering = False
     native_tool_buffer    = ""
 
+    # Diagnostic: when CC_DEBUG_TOOL_CALLS=1, dump every streamed
+    # delta to /tmp/cc_tool_call_debug.log so the user can see what
+    # the upstream model server is really sending. Crucial for
+    # diagnosing vLLM parser ↔ model-format mismatches.
+    _debug_tc = os.environ.get("CC_DEBUG_TOOL_CALLS") == "1"
+    _debug_path = "/tmp/cc_tool_call_debug.log"
+    if _debug_tc:
+        try:
+            with open(_debug_path, "a", encoding="utf-8") as _df:
+                _df.write(f"\n=== STREAM START model={kwargs.get('model','?')} ts={time.time():.0f} ===\n")
+        except Exception:
+            pass
+
     stream = client.chat.completions.create(**kwargs)
     for chunk in stream:
         if not chunk.choices:
@@ -831,6 +923,31 @@ def stream_openai_compat(
             else:
                 native_tool_buffer += new
 
+        # Diagnostic: dump raw delta when in debug mode.
+        if _debug_tc:
+            try:
+                _dump = {
+                    "content": getattr(delta, "content", None),
+                    "tool_calls": [
+                        {
+                            "index": getattr(t, "index", None),
+                            "id": getattr(t, "id", None),
+                            "name": getattr(getattr(t, "function", None),
+                                              "name", None),
+                            "arguments": getattr(getattr(t, "function", None),
+                                                   "arguments", None),
+                        }
+                        for t in (getattr(delta, "tool_calls", None) or [])
+                    ] or None,
+                    "reasoning": getattr(delta, "reasoning_content", None),
+                }
+                if any(_dump.values()):
+                    with open(_debug_path, "a", encoding="utf-8") as _df:
+                        _df.write(json.dumps(_dump, ensure_ascii=False,
+                                              default=str) + "\n")
+            except Exception:
+                pass
+
         if delta.tool_calls:
             for tc in delta.tool_calls:
                 idx = tc.index
@@ -861,6 +978,24 @@ def stream_openai_compat(
             inp = json.loads(v["args"]) if v["args"] else {}
         except json.JSONDecodeError:
             inp = {"_raw": v["args"]}
+        # Recovery: Gemma 4 + vLLM hermes parser sometimes emits a
+        # tool_call with the right name but empty arguments because
+        # the parser ate the `<|tool_call|>` opener but couldn't
+        # locate the JSON body. The args might still be sitting in
+        # the streamed text as `<|channel|>commentary tool=NAME
+        # <|message|>{...}` or `call:NAME{json}` fragments. Try to
+        # recover before we hand an empty dict to a tool that
+        # requires args.
+        if (not inp or inp == {} or (isinstance(inp, dict)
+                                       and "_raw" in inp
+                                       and len(inp) == 1)) \
+                and v["name"] \
+                and (text or native_tool_buffer):
+            recovered = _recover_args_from_text(
+                text + native_tool_buffer, v["name"],
+            )
+            if recovered:
+                inp = recovered
         tc_entry = {"id": v["id"] or f"call_{idx}", "name": v["name"], "input": inp}
         if v.get("extra_content"):
             tc_entry["extra_content"] = v["extra_content"]

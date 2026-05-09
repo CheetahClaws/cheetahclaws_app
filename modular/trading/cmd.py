@@ -269,6 +269,9 @@ def _cmd_trading(args: str, state, config) -> bool:
     elif sub == "factors":
         return _cmd_factors(rest)
 
+    elif sub == "agent":
+        return _cmd_agent(rest, state, config)
+
     else:
         _show_help()
         return True
@@ -475,6 +478,252 @@ def _cmd_factors(args: str) -> bool:
     print()
     print(f.render_factor_table(rows, top=25))
     return True
+
+
+# ── /trading agent — agentic research orchestrator ──────────────────────
+
+
+def _cmd_agent(args: str, state, config) -> bool:
+    """LLM-on-top-of-deterministic-tools research agent.
+
+    Workflow (single LLM round-trip, fast + cheap):
+      1. /trading discover — pure-Python scan SP100 across 4 sources
+      2. /trading factors  — pure-Python factor scores on top hits
+      3. macro snapshot    — SPY/QQQ/VIX/TNX
+      4. LLM synthesis     — read user's question + all structured data
+                              above and produce a focused dossier ranking
+                              candidates by FIT to the question, with
+                              entry consideration + macro overlay.
+
+    The LLM never re-fetches data the deterministic pipeline already
+    has — it only reasons over what's already on the table. This keeps
+    cost low ($0.01-0.05/run on Qwen2.5-72B-class models) and avoids
+    LLMs hallucinating numbers.
+    """
+    if not args.strip():
+        err("Usage: /trading agent <research question>")
+        info("")
+        info("Examples:")
+        info("  /trading agent find AI-infra names with insider buying")
+        info("  /trading agent which sector looks strongest for the next 30 days")
+        info("  /trading agent show me 3 defensive names with positive momentum")
+        info("  /trading agent compare AMZN GOOGL META on quality + momentum")
+        return True
+
+    question = args.strip()
+
+    info(clr("\nTrading Agent — multi-step research", "bold"))
+    info(f"{'=' * 60}")
+    info(f"Question: {question}")
+    info("")
+
+    # ── Step 1: Discovery (deterministic) ────────────────────────────
+    info(clr("Step 1/3: Scanning SP100 candidates via discover...", "cyan"))
+    ranked: list = []
+    discover_notes: list = []
+    try:
+        from .discover.orchestrator import run as discover_run
+        last_done = [0]
+
+        def _disc_progress(done, total, sym):
+            if done - last_done[0] >= 20 or done == total:
+                last_done[0] = done
+                print(f"  [{done}/{total}] {sym}", flush=True)
+
+        result = discover_run(
+            sources=None,           # all four scanners
+            universe="sp100",
+            top_n=20,
+            progress_cb=_disc_progress,
+        )
+        ranked = result.get("ranked", []) or []
+        discover_notes = result.get("notes", []) or []
+        ok(f"  → {result.get('n_unique', 0)} unique tickers, "
+           f"{result.get('n_total_hits', 0)} hits")
+    except Exception as e:
+        err(f"  Discovery failed: {type(e).__name__}: {e}")
+        ranked = []
+
+    # ── Step 2: Factor scores on top discoveries ─────────────────────
+    info(clr("\nStep 2/3: Computing factor scores on top candidates...",
+              "cyan"))
+    factor_summary: list = []
+    if ranked:
+        try:
+            from . import factors as f
+            symbols = [r["symbol"] for r in ranked[:15]]
+            last_f = [0]
+
+            def _f_progress(done, total, sym):
+                if done - last_f[0] >= 5 or done == total:
+                    last_f[0] = done
+                    print(f"  [{done}/{total}] {sym}", flush=True)
+
+            rows = f.scan_universe(symbols, progress_cb=_f_progress)
+            scored = f.score(rows)
+            for r in scored:
+                factor_summary.append({
+                    "symbol":     r.symbol,
+                    "momentum":   r.momentum_score,
+                    "quality":    r.quality_score,
+                    "low_vol":    r.low_vol_score,
+                    "composite":  r.composite_score,
+                })
+            ok(f"  → factor scores computed for {len(factor_summary)} "
+               f"symbol(s)")
+        except Exception as e:
+            err(f"  Factor scan failed: {type(e).__name__}: {e}")
+
+    # ── Step 3: Macro context ─────────────────────────────────────────
+    info(clr("\nStep 3/3: Loading macro context...", "cyan"))
+    macro_block = "(macro context unavailable)"
+    try:
+        from . import macro
+        macro_block = macro.render_macro_context()
+        ok("  → macro snapshot loaded")
+    except Exception as e:
+        err(f"  Macro failed: {type(e).__name__}: {e}")
+
+    # ── Build prompt for LLM synthesis ────────────────────────────────
+    prompt = _build_agent_prompt(
+        question=question,
+        ranked=ranked,
+        factors=factor_summary,
+        macro_block=macro_block,
+        discover_notes=discover_notes,
+    )
+
+    info(clr("\nSending compiled brief to AI for synthesis...\n", "cyan"))
+    return ("__ssj_query__", prompt)
+
+
+def _build_agent_prompt(
+    *,
+    question: str,
+    ranked: list,
+    factors: list,
+    macro_block: str,
+    discover_notes: list,
+) -> str:
+    """Compose the dossier-synthesis prompt. All structured data is
+    embedded inline so the LLM doesn't need to call any tools — pure
+    reasoning, single round-trip."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Discovery table
+    if ranked:
+        lines = [
+            "## Discovery candidates (top 20, ranked by aggregate score)",
+            "Sources: insider (SEC EDGAR Form 4), earnings (yfinance "
+            "earnings beats), momentum-quality (yfinance factors), "
+            "sector (SPDR Select ETFs). Weights: insider 1.0, earnings "
+            "0.9, momentum-quality 0.7, sector 0.5; +0.5 bonus when ≥2 "
+            "sources flag the same ticker.",
+            "",
+            "| # | Symbol | Sources | Score | Top reasons |",
+            "|---:|---|---|---:|---|",
+        ]
+        for i, r in enumerate(ranked[:20], 1):
+            srcs = " · ".join(sorted(set(r.get("sources", []))))
+            reasons = "; ".join(r.get("reasons", [])[:2])
+            if len(reasons) > 220:
+                reasons = reasons[:217] + "..."
+            score_v = r.get("aggregate_score", 0.0)
+            lines.append(
+                f"| {i} | **{r.get('symbol','')}** | {srcs} | "
+                f"{score_v:.2f} | {reasons} |"
+            )
+        discover_md = "\n".join(lines)
+    else:
+        discover_md = ("## Discovery candidates\n_No candidates "
+                        "returned — discovery layer failed or filters "
+                        "too tight. The user may be asking about specific "
+                        "symbols not in SP100; reason from the question "
+                        "directly._")
+
+    # Factor table
+    if factors:
+        lines = [
+            "## Factor scores (top 15 of discovery candidates)",
+            "Scores normalised 0-1 within the scanned cohort. Composite "
+            "= 0.5×momentum + 0.3×quality + 0.2×low_vol.",
+            "",
+            "| Symbol | Momentum | Quality | Low-Vol | Composite |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for f_ in factors:
+            def _fmt(v):
+                return f"{v:.2f}" if isinstance(v, (int, float)) else "—"
+            lines.append(
+                f"| {f_['symbol']} | {_fmt(f_.get('momentum'))} | "
+                f"{_fmt(f_.get('quality'))} | "
+                f"{_fmt(f_.get('low_vol'))} | "
+                f"{_fmt(f_.get('composite'))} |"
+            )
+        factor_md = "\n".join(lines)
+    else:
+        factor_md = "## Factor scores\n_(unavailable)_"
+
+    # Discovery notes (errors, skipped sources, etc.)
+    notes_md = ""
+    if discover_notes:
+        notes_md = ("## Discovery notes\n"
+                     + "\n".join(f"- {n}" for n in discover_notes))
+
+    return f"""You are a senior portfolio research analyst writing a
+focused investment dossier for the user. The data below was just
+gathered from SEC EDGAR + Yahoo Finance via deterministic Python
+pipelines — treat it as authoritative current state. Today is {today}.
+
+## User's research question
+> {question}
+
+{macro_block}
+
+{discover_md}
+
+{factor_md}
+
+{notes_md}
+
+---
+
+## Your task
+
+Produce a markdown dossier that is **decisive and concise**. Structure:
+
+### 1. Top 5 candidates ranked by FIT to the user's question
+Re-rank the discovery list specifically for the user's ask (not the raw
+score). For each of 5:
+- **Symbol — 1-line thesis** explaining why this matches the user's
+  question (cite specific data: insider count, earnings beat %, factor
+  scores, sector rank).
+- **Bull point** (1 sentence, from the data above).
+- **Risk / bear point** (1 sentence — what would invalidate the thesis).
+- **Entry consideration** (price level / catalyst / timing trigger).
+
+### 2. Macro overlay (3-5 sentences)
+Given the macro context above (regime, VIX, yields), which 1-2 of your 5
+become higher-conviction and which become lower-conviction? Why?
+
+### 3. What to do next
+- **Top 1-2** that deserve a full multi-agent debate via
+  `/trading analyze <SYMBOL>` first. Order them by priority.
+- Any candidates you are explicitly **passing on** despite a high score,
+  and the reason.
+
+### Constraints
+- **Be decisive**: no hedging like "could potentially". Take a position.
+- **Cite data points** from the tables above (`12 Form 4 filings`,
+  `+8.2% sector 1m`, `momentum 0.74`, etc.) — don't make up numbers.
+- **Don't recommend buying**. The user does the buying. You decide what
+  deserves their attention next.
+- **Form 4 caveat**: filings are *counted*, not direction-parsed. A
+  high count could be either heavy buying OR heavy selling — flag any
+  candidates where the user should manually verify direction via the
+  SEC URLs.
+- Keep the whole dossier under ~600 words. Tight and actionable.
+"""
 
 
 # ── /trading review (add/reduce/exit on existing positions) ──────────────
@@ -1322,6 +1571,15 @@ def _show_help() -> bool:
     info("                                         Anomaly + stop + earnings + insider monitor")
     info("                                         (--notify dispatches to bridges)")
     info("  /trading monitor status                Show last monitor run stats")
+    info("")
+    info(clr("Agentic research (LLM on top of deterministic tools):", "cyan"))
+    info("  /trading agent <natural-language research question>")
+    info("                                       Auto-runs discover + factors + macro,")
+    info("                                       then LLM synthesizes a focused dossier")
+    info("                                       ranked by FIT to your question.")
+    info("                                       Examples:")
+    info("                                         /trading agent find AI-infra names with insider buying")
+    info("                                         /trading agent 3 defensive names with positive momentum")
     info("")
     info(clr("Position management & autonomous mode:", "cyan"))
     info("  /trading review [SYMBOL]             Multi-agent debate on EXISTING positions")
