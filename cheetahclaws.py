@@ -681,6 +681,50 @@ def setup_readline(history_file: Path):
 
 # ── Headless bridge bootstrap (used by --web / Docker server mode) ────────
 
+def _make_bridge_slash_handler(state, config, run_query):
+    """Build the ``session_ctx.handle_slash`` callback used by Telegram /
+    Slack / WeChat bridges. Calls the top-level ``handle_slash(line, state,
+    config)`` and processes sentinel tuples by routing them through the
+    supplied ``run_query``.
+
+    Returns ``"simple"`` when the command finishes synchronously
+    (toggle-like commands such as ``/help``, ``/status``, ``/model``) and
+    ``"query"`` when a background agent run was started for a sentinel
+    workflow (``__brainstorm__`` / ``__worker__``).
+
+    Used by both ``repl()`` (interactive terminal) and
+    ``_start_headless_bridges()`` (Docker / ``--web`` headless deploys) so
+    the slash-command path on every bridge stays mode-agnostic.
+    """
+    def _handler(line: str):
+        result = handle_slash(line, state, config)
+        if not isinstance(result, tuple):
+            return "simple"
+        if result[0] == "__brainstorm__":
+            _, brain_payload, brain_out_file = result
+            _todo_path = str(Path(brain_out_file).parent / "todo_list.txt")
+            run_query(
+                brain_payload + "\n\n"
+                f"Now write the todo list file at {_todo_path}.\n\n"
+                "STRICT RULES:\n"
+                "1. Call Write EXACTLY ONCE with the full todo content. "
+                "One task per line, each starting with '- [ ] '. Order "
+                "by priority. Keep names / numbers / paths intact.\n"
+                "2. Do NOT call Read — there is nothing to read.\n"
+                "3. Do NOT call Bash to verify the file was created.\n"
+                "4. Do NOT echo the file content back after Write.\n"
+                "5. After the single Write succeeds, your turn ENDS."
+            )
+        elif result[0] == "__worker__":
+            _, worker_tasks = result
+            for i, (line_idx, task_text, prompt) in enumerate(worker_tasks):
+                print(clr(f"\n  ── Worker ({i+1}/{len(worker_tasks)}): "
+                          f"{task_text} ──", "yellow"))
+                run_query(prompt)
+        return "query"
+    return _handler
+
+
 def _start_headless_bridges(config: dict) -> None:
     """Auto-start configured Telegram/WeChat/Slack bridges in headless mode.
 
@@ -719,6 +763,13 @@ def _start_headless_bridges(config: dict) -> None:
             pass  # never let a bridge query crash the server thread
 
     session_ctx.run_query = _headless_run_query
+    # Wire slash-command dispatch so bridges' /<cmd> messages don't go to
+    # /dev/null. Without this, bridges/telegram.py:533+ falls through to
+    # `continue` (no reply, no log) because `session_ctx.handle_slash` is
+    # None — issue #84 follow-up.
+    session_ctx.handle_slash = _make_bridge_slash_handler(
+        state, config, _headless_run_query
+    )
 
     if config.get("telegram_token") and config.get("telegram_chat_id"):
         if not (_btg._telegram_thread and _btg._telegram_thread.is_alive()):
@@ -1109,37 +1160,11 @@ def repl(config: dict, initial_prompt: str = None):
         session_ctx.last_interaction_time = time.time()
 
     session_ctx.run_query = lambda msg: run_query(msg, is_background=True)
-
-    def _handle_slash_from_telegram(line: str):
-        """Process a /command from Telegram, handling sentinels inline.
-        Returns 'simple' for toggle commands, 'query' if run_query was called."""
-        result = handle_slash(line, state, config)
-        if not isinstance(result, tuple):
-            return "simple"
-        # Process sentinels the same way the REPL does
-        if result[0] == "__brainstorm__":
-            _, brain_payload, brain_out_file = result
-            _todo_path = str(Path(brain_out_file).parent / "todo_list.txt")
-            run_query(
-                brain_payload + "\n\n"
-                f"Now write the todo list file at {_todo_path}.\n\n"
-                "STRICT RULES:\n"
-                "1. Call Write EXACTLY ONCE with the full todo content. "
-                "One task per line, each starting with '- [ ] '. Order "
-                "by priority. Keep names / numbers / paths intact.\n"
-                "2. Do NOT call Read — there is nothing to read.\n"
-                "3. Do NOT call Bash to verify the file was created.\n"
-                "4. Do NOT echo the file content back after Write.\n"
-                "5. After the single Write succeeds, your turn ENDS."
-            )
-        elif result[0] == "__worker__":
-            _, worker_tasks = result
-            for i, (line_idx, task_text, prompt) in enumerate(worker_tasks):
-                print(clr(f"\n  ── Worker ({i+1}/{len(worker_tasks)}): {task_text} ──", "yellow"))
-                run_query(prompt)
-        return "query"
-
-    session_ctx.handle_slash = _handle_slash_from_telegram
+    # Same handler used by the headless bridges path — see
+    # `_make_bridge_slash_handler` for sentinel processing.
+    session_ctx.handle_slash = _make_bridge_slash_handler(
+        state, config, run_query
+    )
 
     # ── Auto-start Telegram bridge if configured ──────────────────────
     if config.get("telegram_token") and config.get("telegram_chat_id"):
