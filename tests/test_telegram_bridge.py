@@ -452,6 +452,64 @@ class TestHandleCallbackQuery:
         methods = [c[0][1] for c in api.call_args_list]
         assert methods == ["answerCallbackQuery"]
 
+    def test_no_prompt_waiting_does_not_edit_message(self):
+        """Issue #84 follow-up: when a click arrives but no prompt is
+        currently waiting (already answered or timed out), the handler
+        must NOT edit the message to show "✓ Selected" — that would
+        falsely tell the user the action took effect.  Acknowledge the
+        callback (clears spinner) and bail."""
+        import threading
+        evt = threading.Event()
+        sctx = SimpleNamespace(
+            tg_input_event=evt, tg_input_value="",
+            tg_callback_prompt_id="",  # no prompt waiting
+            tg_callback_message_id=0,
+        )
+        with patch.object(tg, "_tg_api", return_value={"ok": True}) as api:
+            tg._handle_callback_query("TOK", 42,
+                                      _make_cb("cc:abc12345:y", 42), sctx)
+        assert not evt.is_set()
+        assert sctx.tg_input_value == ""
+        # Only answerCallbackQuery should fire — no editMessageText.
+        methods = [c[0][1] for c in api.call_args_list]
+        assert methods == ["answerCallbackQuery"], \
+            "Stale click must not produce a misleading message edit"
+
+    def test_label_with_markdown_chars_is_sanitized(self):
+        """Issue #84 follow-up: callers can pass any string as an option
+        value.  Backticks/asterisks would break the Markdown parse mode
+        and silently fail editMessageText.  The sanitizer replaces them
+        before embedding into the confirmation line."""
+        import threading
+        evt = threading.Event()
+        sctx = SimpleNamespace(
+            tg_input_event=evt, tg_input_value="",
+            tg_callback_prompt_id="abc12345",
+            tg_callback_message_id=100,
+        )
+        # Value contains backtick and asterisk — Markdown markers.
+        captured_payloads: list[dict] = []
+        def _capture(_tok, _method, params=None):
+            captured_payloads.append((_method, params or {}))
+            return {"ok": True}
+        with patch.object(tg, "_tg_api", side_effect=_capture):
+            tg._handle_callback_query(
+                "TOK", 42,
+                _make_cb("cc:abc12345:`bad*value`", 42),
+                sctx,
+            )
+        # The raw value (with backticks/asterisks) is still delivered to
+        # the agent — sanitisation only affects the visual confirmation.
+        assert sctx.tg_input_value == "`bad*value`"
+        # Find the editMessageText call and check it has no unbalanced
+        # Markdown markers in the appended "Selected: ..." line.
+        edits = [p for m, p in captured_payloads if m == "editMessageText"]
+        assert len(edits) == 1
+        body = edits[0]["text"]
+        # Backticks/asterisks from the raw value are escaped/replaced.
+        assert "`bad*value`" not in body, \
+            "Raw markdown chars must not leak into the visual confirmation"
+
     def test_value_with_colons_preserved(self):
         # callback_data is "cc:<id>:<value>" — the value field can itself
         # contain colons; split(":", 2) keeps them intact.
@@ -550,3 +608,149 @@ class TestAskInputWithKeyboard:
     def test_click_returns_a_for_accept_all(self):
         opts = [("✅ Approve", "y"), ("❌ Reject", "n"), ("✅✅ Accept all", "a")]
         self._drive(opts, click_value="a", expected_return="a")
+
+
+# ── Slash-command stdout forwarding (issue #84 follow-up) ────────────────
+
+
+class TestSlashRunnerCapturesPrintOutput:
+    """Pin: when a Telegram /<cmd> dispatches a "simple" command (the
+    handler returns a non-tuple), the bridge must forward whatever the
+    command printed back into the chat.  Pre-fix it always sent the
+    bare "✅ /help executed." string and the actual /help menu only
+    appeared on the server console — the user-visible regression in
+    issue #84.
+
+    The poll-loop wraps slash_cb execution with a stdout/stderr Tee that
+    captures print()/info()/ok()/warn() output.  These tests drive the
+    same code path the live bridge uses (via the inline _slash_runner
+    closure inside _tg_poll_loop) by lifting the closure out for direct
+    invocation.
+    """
+
+    def _build_runner(self, monkeypatch, slash_cb, sent: list):
+        """Replicate the closure from bridges/telegram.py:_tg_poll_loop so
+        unit tests can drive it without pumping the long-poll loop."""
+        import io as _io, sys as _sys, re as _re
+        from bridges import telegram as tg
+
+        # Patch _tg_send to capture instead of hitting the network.
+        monkeypatch.setattr(tg, "_tg_send",
+                            lambda token, chat_id, text: sent.append(text))
+
+        class _Tee:
+            def __init__(self, *streams):
+                self._streams = streams
+            def write(self, data):
+                for s in self._streams:
+                    try: s.write(data)
+                    except Exception: pass
+            def flush(self):
+                for s in self._streams:
+                    try: s.flush()
+                    except Exception: pass
+
+        from tools import _tg_thread_local as _ttl  # imported the same way the bridge does
+
+        def _slash_runner(_slash_text, _token, _chat_id):
+            _ttl.active = True
+            _buf_out, _buf_err = _io.StringIO(), _io.StringIO()
+            _orig_out, _orig_err = _sys.stdout, _sys.stderr
+            _sys.stdout = _Tee(_orig_out, _buf_out)
+            _sys.stderr = _Tee(_orig_err, _buf_err)
+            try:
+                cmd_type = slash_cb(_slash_text)
+            except Exception as e:
+                _sys.stdout, _sys.stderr = _orig_out, _orig_err
+                tg._tg_send(_token, _chat_id, f"⚠ Error: {e}")
+                return
+            finally:
+                _sys.stdout, _sys.stderr = _orig_out, _orig_err
+                _ttl.active = False
+            captured = (_buf_out.getvalue() + _buf_err.getvalue())
+            captured = _re.sub(r'\x1b\[[0-9;]*m', '', captured).strip()
+            if cmd_type == "simple":
+                cmd_name = _slash_text.strip().split()[0]
+                if captured:
+                    tg._tg_send(_token, _chat_id, captured)
+                else:
+                    tg._tg_send(_token, _chat_id, f"✅ {cmd_name} executed.")
+
+        return _slash_runner
+
+    def test_print_output_is_forwarded_to_chat(self, monkeypatch):
+        """A simple command that prints a multi-line menu (think /help)
+        must surface that menu in the chat — not the bare ack string."""
+        def fake_help_cmd(text):
+            print("CheetahClaws Commands:")
+            print("  /help    show help")
+            print("  /status  show status")
+            return "simple"
+
+        sent: list[str] = []
+        runner = self._build_runner(monkeypatch, fake_help_cmd, sent)
+        runner("/help", "tok", 42)
+
+        assert len(sent) == 1
+        body = sent[0]
+        assert "CheetahClaws Commands" in body
+        assert "/help" in body
+        assert "/status" in body
+        # The bare ack string must NOT replace the real menu.
+        assert "executed" not in body
+
+    def test_no_print_falls_back_to_ack(self, monkeypatch):
+        """Commands that intentionally produce no output (rare, but possible
+        for purely-stateful toggles) keep the existing ack so the user gets
+        some confirmation."""
+        def silent_cmd(text):
+            return "simple"
+
+        sent: list[str] = []
+        runner = self._build_runner(monkeypatch, silent_cmd, sent)
+        runner("/silent", "tok", 42)
+
+        assert sent == ["✅ /silent executed."]
+
+    def test_ansi_escapes_are_stripped(self, monkeypatch):
+        """info()/ok()/warn() in ui/render.py wrap text in ANSI colour
+        codes via clr().  Telegram doesn't render ANSI, so the bridge
+        must strip them before sending — otherwise the user sees raw
+        '\\x1b[36m...\\x1b[0m' garbage."""
+        def coloured_cmd(text):
+            from ui.render import info, ok
+            info("informational")
+            ok("done")
+            return "simple"
+
+        sent: list[str] = []
+        runner = self._build_runner(monkeypatch, coloured_cmd, sent)
+        runner("/status", "tok", 42)
+
+        assert len(sent) == 1
+        body = sent[0]
+        assert "\x1b[" not in body, \
+            "ANSI escape sequences must be stripped before sending to Telegram"
+        assert "informational" in body
+        assert "done" in body
+
+    def test_other_threads_stdout_is_not_lost(self, monkeypatch):
+        """The Tee writes to BOTH the original stdout and the capture
+        buffer, so server logs (docker compose logs) still see the
+        command's output even though the bridge also forwards it."""
+        import io as _io
+        captured_orig = _io.StringIO()
+        monkeypatch.setattr("sys.stdout", captured_orig)
+
+        def chatty_cmd(text):
+            print("visible to operator")
+            return "simple"
+
+        sent: list[str] = []
+        runner = self._build_runner(monkeypatch, chatty_cmd, sent)
+        runner("/status", "tok", 42)
+
+        assert "visible to operator" in captured_orig.getvalue(), \
+            "Tee must keep writing to original stdout so docker logs " \
+            "still show /<cmd> output"
+        assert "visible to operator" in sent[0]

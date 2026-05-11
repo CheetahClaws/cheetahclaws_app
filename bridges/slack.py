@@ -252,20 +252,48 @@ def _slack_poll_loop(token: str, channel: str, config: dict) -> str:
                     slash_cb = session_ctx.handle_slash
                     if slash_cb:
                         def _slack_slash_runner(_slash_text, _ch):
+                            import io as _io, sys as _sys, re as _re_ansi
                             _slack_thread_local.active = True
                             sctx = runtime.get_ctx(config)
                             sctx.slack_current_channel = _ch
+                            # Capture print()/info()/ok() output so commands
+                            # like /help (which render via print) reach the
+                            # user instead of disappearing into server logs
+                            # (issue #84 follow-up — same root cause as the
+                            # Telegram bridge).
+                            _buf_out, _buf_err = _io.StringIO(), _io.StringIO()
+                            _orig_out, _orig_err = _sys.stdout, _sys.stderr
+                            class _Tee:
+                                def __init__(self, *streams):
+                                    self._streams = streams
+                                def write(self, data):
+                                    for s in self._streams:
+                                        try: s.write(data)
+                                        except Exception: pass
+                                def flush(self):
+                                    for s in self._streams:
+                                        try: s.flush()
+                                        except Exception: pass
+                            _sys.stdout = _Tee(_orig_out, _buf_out)
+                            _sys.stderr = _Tee(_orig_err, _buf_err)
                             try:
                                 cmd_type = slash_cb(_slash_text)
                             except Exception as e:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _slack_send(token, _ch, f"⚠ Error: {e}")
                                 return
                             finally:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _slack_thread_local.active = False
                                 sctx.slack_current_channel = None
+                            _captured = (_buf_out.getvalue() + _buf_err.getvalue())
+                            _captured = _re_ansi.sub(r'\x1b\[[0-9;]*m', '', _captured).strip()
                             if cmd_type == "simple":
                                 cmd_name = _slash_text.strip().split()[0]
-                                _slack_send(token, _ch, f"✅ {cmd_name} executed.")
+                                if _captured:
+                                    _slack_send(token, _ch, _captured)
+                                else:
+                                    _slack_send(token, _ch, f"✅ {cmd_name} executed.")
                                 return
                             slack_state = session_ctx.agent_state
                             if slack_state and slack_state.messages:

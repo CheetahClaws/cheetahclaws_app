@@ -90,6 +90,55 @@ CheetahClaws: **A Lightweight** and **Easy-to-Use** Python Reimplementation of C
 
 
 ### Demos
+
+#### Interactive terminal recordings (animated SVG — plays inline, no click needed)
+
+<div align="center">
+<img src="docs/media/casts/code_review.svg" width="850" alt="CheetahClaws code review demo"/>
+</div>
+<div align="center"><sub><i>Code review: profile a slow Python function, switch to local Ollama, apply the fix — 11× faster</i></sub></div>
+
+<br/>
+
+<div align="center">
+<img src="docs/media/casts/research.svg" width="900" alt="CheetahClaws /research 20-source pipeline"/>
+</div>
+<div align="center"><sub><i><code>/research</code>: parallel fan-out across 20 sources incl. 知乎 / B站 / 微博 / 小红书, cross-platform attention heat table, citation verification</i></sub></div>
+
+<br/>
+
+<div align="center">
+<img src="docs/media/casts/brainstorm.svg" width="900" alt="CheetahClaws /brainstorm multi-persona debate"/>
+</div>
+<div align="center"><sub><i><code>/brainstorm</code>: 5 expert personas (Architect / Skeptic / Pragmatist / DBA / PM) adversarially debate, then converge on a <code>todo_list.txt</code> ready for <code>/worker</code></i></sub></div>
+
+<br/>
+
+<div align="center">
+<img src="docs/media/casts/lab.svg" width="900" alt="CheetahClaws /lab autonomous paper writing"/>
+</div>
+<div align="center"><sub><i><code>/lab</code> (Research Lab): 9 specialised agents drive a paper through 9 stages — questioning → survey → outline → sandboxed Python experiment → reviewer loop → citation verification → finalisation</i></sub></div>
+
+<br/>
+
+<div align="center">
+<img src="docs/media/casts/research_agent.svg" width="900" alt="CheetahClaws /agent research_assistant autonomous loop"/>
+</div>
+<div align="center"><sub><i><code>/agent research_assistant</code>: autonomous background loop running every 4h, pushes daily digests to Telegram. Stagnation-stop guard auto-pauses to save tokens when output stops changing.</i></sub></div>
+
+<br/>
+
+<div align="center">
+<img src="docs/media/casts/telegram.svg" width="900" alt="CheetahClaws Telegram bridge remote control"/>
+</div>
+<div align="center"><sub><i>Telegram bridge: full chat round-trip, slash-command passthrough, job queue with <code>!jobs</code>/<code>!cancel</code>, push notifications when long-running tasks finish. Same UX for <code>/wechat</code> and <code>/slack</code>.</i></sub></div>
+
+<br/>
+
+> **Tip:** the recordings are animated SVGs at [`docs/media/casts/`](docs/media/casts/). Source `.cast` files (asciinema v2) live next to them — replay locally with `asciinema play <file>.cast` or re-render with `svg-term --in <file>.cast --out <file>.svg`.
+
+---
+
  <div align=center>
  <img src="docs/media/demos/demo.gif" width="850"/> 
  </div>

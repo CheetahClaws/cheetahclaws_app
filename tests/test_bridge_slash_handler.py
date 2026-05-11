@@ -127,3 +127,117 @@ def test_handler_is_assigned_in_headless_bridges_bootstrap(monkeypatch):
         "handle_slash must be wired in headless bootstrap (issue #84 follow-up)"
     assert callable(ctx.run_query), \
         "run_query must be wired in headless bootstrap"
+
+
+def test_headless_bootstrap_wires_tg_send(monkeypatch):
+    """Issue #84 follow-up: ask_input_interactive only routes to Telegram when
+    session_ctx.tg_send is non-None.  Headless bootstrap previously left it
+    unset, so inline-keyboard approval prompts never reached the user — the
+    bridge silently fell through to terminal input()."""
+    import runtime, cheetahclaws as cc
+    sid = "test-headless-tgsend-wire"
+    config = {
+        "_session_id": sid,
+        "telegram_token": "FAKE_TOKEN",
+        "telegram_chat_id": 9999,
+    }
+    monkeypatch.setattr(cc._btg, "_telegram_thread", None)
+
+    class _NoopThread:
+        def start(self): pass
+        def is_alive(self): return False
+    monkeypatch.setattr("threading.Thread", lambda *a, **kw: _NoopThread())
+
+    cc._start_headless_bridges(config)
+
+    ctx = runtime.get_session_ctx(sid)
+    assert callable(ctx.tg_send), \
+        "tg_send must be wired in headless bootstrap so ask_input_interactive " \
+        "can render Telegram inline-keyboard prompts (issue #84)"
+
+
+def test_headless_run_query_handles_permission_request(monkeypatch):
+    """Issue #84 follow-up: in headless mode the agent loop yields a
+    PermissionRequest event for sensitive tools.  Pre-fix that event was
+    dropped, leaving event.granted=False, so every approval-required tool
+    silently denied without ever asking the user."""
+    import runtime, cheetahclaws as cc
+    from agent import PermissionRequest
+
+    sid = "test-headless-permission-event"
+    config = {
+        "_session_id": sid,
+        "telegram_token": "FAKE_TOKEN",
+        "telegram_chat_id": 7777,
+    }
+    monkeypatch.setattr(cc._btg, "_telegram_thread", None)
+
+    class _NoopThread:
+        def start(self): pass
+        def is_alive(self): return False
+    monkeypatch.setattr("threading.Thread", lambda *a, **kw: _NoopThread())
+
+    # Stub the agent loop: yield exactly one PermissionRequest, then stop.
+    captured: list[PermissionRequest] = []
+    def _fake_run(prompt, state, cfg, system_prompt):
+        req = PermissionRequest(description="mkdir test_folder")
+        captured.append(req)
+        yield req
+
+    monkeypatch.setattr("agent.run", _fake_run)
+    monkeypatch.setattr(cc, "ask_permission_interactive",
+                        lambda desc, cfg: True)
+    monkeypatch.setattr("context.build_system_prompt", lambda c: "sys")
+
+    cc._start_headless_bridges(config)
+    ctx = runtime.get_session_ctx(sid)
+
+    ctx.run_query("please make a folder")
+
+    assert len(captured) == 1
+    assert captured[0].granted is True, \
+        "_headless_run_query must consult ask_permission_interactive on " \
+        "PermissionRequest events (issue #84)"
+
+
+def test_headless_run_query_promotes_telegram_incoming(monkeypatch):
+    """When a Telegram message triggers the agent, _bg_runner sets
+    telegram_incoming=True before calling run_query.  _headless_run_query
+    must promote that to in_telegram_turn so _is_in_tg_turn() returns True
+    while ask_input_interactive routes the prompt — otherwise prompts fall
+    through to terminal input()."""
+    import runtime, cheetahclaws as cc
+
+    sid = "test-headless-turn-promotion"
+    config = {
+        "_session_id": sid,
+        "telegram_token": "FAKE_TOKEN",
+        "telegram_chat_id": 4242,
+    }
+    monkeypatch.setattr(cc._btg, "_telegram_thread", None)
+
+    class _NoopThread:
+        def start(self): pass
+        def is_alive(self): return False
+    monkeypatch.setattr("threading.Thread", lambda *a, **kw: _NoopThread())
+
+    seen_in_turn: list[bool] = []
+    def _fake_run(prompt, state, cfg, system_prompt):
+        seen_in_turn.append(runtime.get_session_ctx(sid).in_telegram_turn)
+        return iter(())  # generator yielding nothing
+
+    monkeypatch.setattr("agent.run", _fake_run)
+    monkeypatch.setattr("context.build_system_prompt", lambda c: "sys")
+
+    cc._start_headless_bridges(config)
+    ctx = runtime.get_session_ctx(sid)
+
+    ctx.telegram_incoming = True
+    ctx.run_query("hi")
+
+    assert seen_in_turn == [True], \
+        "in_telegram_turn must be True during the agent run, not just before " \
+        "and after (issue #84)"
+    assert ctx.in_telegram_turn is False, \
+        "in_telegram_turn must be cleared after the run so the next " \
+        "non-Telegram event isn't misrouted"
