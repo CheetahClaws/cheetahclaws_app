@@ -615,20 +615,48 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
                     slash_cb = session_ctx.handle_slash
                     if slash_cb:
                         def _wx_slash_runner(_slash_text, _uid):
+                            import io as _io, sys as _sys, re as _re_ansi
                             _wx_thread_local.active = True
                             sctx = runtime.get_ctx(config)
                             sctx.wx_current_user_id = _uid
+                            # Capture print()/info()/ok() output so commands
+                            # like /help (which render via print) reach the
+                            # user instead of disappearing into server logs
+                            # (issue #84 follow-up — same root cause as the
+                            # Telegram bridge).
+                            _buf_out, _buf_err = _io.StringIO(), _io.StringIO()
+                            _orig_out, _orig_err = _sys.stdout, _sys.stderr
+                            class _Tee:
+                                def __init__(self, *streams):
+                                    self._streams = streams
+                                def write(self, data):
+                                    for s in self._streams:
+                                        try: s.write(data)
+                                        except Exception: pass
+                                def flush(self):
+                                    for s in self._streams:
+                                        try: s.flush()
+                                        except Exception: pass
+                            _sys.stdout = _Tee(_orig_out, _buf_out)
+                            _sys.stderr = _Tee(_orig_err, _buf_err)
                             try:
                                 cmd_type = slash_cb(_slash_text)
                             except Exception as e:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _wx_send(_uid, f"⚠ Error: {e}", config)
                                 return
                             finally:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _wx_thread_local.active = False
                                 sctx.wx_current_user_id = None
+                            _captured = (_buf_out.getvalue() + _buf_err.getvalue())
+                            _captured = _re_ansi.sub(r'\x1b\[[0-9;]*m', '', _captured).strip()
                             if cmd_type == "simple":
                                 cmd_name = _slash_text.strip().split()[0]
-                                _wx_send(_uid, f"✅ {cmd_name} executed.", config)
+                                if _captured:
+                                    _wx_send(_uid, _captured, config)
+                                else:
+                                    _wx_send(_uid, f"✅ {cmd_name} executed.", config)
                                 return
                             wx_state = session_ctx.agent_state
                             if wx_state and wx_state.messages:

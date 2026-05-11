@@ -739,14 +739,28 @@ def _start_headless_bridges(config: dict) -> None:
         return  # nothing configured — no-op
 
     import runtime as _runtime
-    from agent import AgentState, run as _agent_run, TextChunk, ToolStart, ToolEnd
+    from agent import (
+        AgentState, run as _agent_run,
+        TextChunk, ToolStart, ToolEnd, PermissionRequest,
+    )
     from context import build_system_prompt
 
     state = AgentState(messages=[], total_input_tokens=0, total_output_tokens=0)
     session_ctx = _runtime.get_session_ctx(config.get("_session_id", "default"))
     session_ctx.agent_state = state
+    # Wire the low-level Telegram sender so ask_input_interactive can render
+    # inline-keyboard permission prompts.  Without this, the Telegram branch
+    # in tools/interaction.py:256 falls through to terminal input(), making
+    # approval prompts invisible in headless/Docker mode (issue #84 follow-up).
+    session_ctx.tg_send = _tg_send
 
     def _headless_run_query(prompt: str, is_background: bool = False) -> None:
+        # Promote the per-turn telegram_incoming flag so _is_in_tg_turn() sees
+        # in_telegram_turn=True for the duration of this query.  Without this,
+        # ask_input_interactive routes prompts to the terminal even though the
+        # query was triggered by an inbound Telegram message.
+        session_ctx.in_telegram_turn = session_ctx.telegram_incoming
+        session_ctx.telegram_incoming = False
         system_prompt = build_system_prompt(config)
         try:
             for ev in _agent_run(prompt, state, config, system_prompt):
@@ -759,8 +773,20 @@ def _start_headless_bridges(config: dict) -> None:
                 elif isinstance(ev, ToolEnd) and session_ctx.on_tool_end:
                     try: session_ctx.on_tool_end(ev.name, str(ev.result or "")[:500])
                     except Exception: pass
+                elif isinstance(ev, PermissionRequest):
+                    # Mirror repl()'s permission handling so headless deploys
+                    # actually surface the [Approve][Reject][Accept all]
+                    # inline-keyboard prompt over the bridge.  Defaults to
+                    # denied on any failure so a broken bridge never auto-runs
+                    # a sensitive tool.
+                    try:
+                        ev.granted = ask_permission_interactive(ev.description, config)
+                    except Exception:
+                        ev.granted = False
         except Exception:
             pass  # never let a bridge query crash the server thread
+        finally:
+            session_ctx.in_telegram_turn = False
 
     session_ctx.run_query = _headless_run_query
     # Wire slash-command dispatch so bridges' /<cmd> messages don't go to

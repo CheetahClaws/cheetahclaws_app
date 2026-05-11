@@ -130,17 +130,27 @@ def _handle_callback_query(token: str, chat_id: int, cb: dict,
 
     _, prompt_id, value = cb_data.split(":", 2)
     expected = getattr(session_ctx, "tg_callback_prompt_id", "") or ""
-    if expected and expected != prompt_id:
+    if not expected:
+        # No prompt is currently waiting — this click belongs to an
+        # already-answered or timed-out prompt.  Don't edit the message
+        # with a fake "✓ Selected" confirmation; the user would think the
+        # action took effect when in fact nothing happens (issue #84
+        # follow-up).  The acknowledgeCallbackQuery above clears the
+        # spinner so the click still feels handled.
+        return
+    if expected != prompt_id:
         # Stale click from an earlier prompt — ignore so the live prompt
         # keeps waiting for its own button press.
         return
 
-    # Find the human label for this value, if we can match the message text.
-    label_for_value = value
-    for line in cb_text.splitlines():
-        # Lines look like "[1] ✅ Approve — y" but the label format is owned by
-        # the caller, so just take the value verbatim if no match.
-        pass
+    # Sanitize the value for visual confirmation.  Callers can pass any
+    # string as the option value (it travels in callback_data), so escape
+    # backticks/Markdown markers before embedding in the edited message —
+    # otherwise editMessageText silently fails on parse errors and the
+    # user just sees the original prompt unchanged.
+    label_for_value = (
+        str(value).replace("\\", "\\\\").replace("`", "'").replace("*", "·")
+    )
 
     if cb_msg:
         new_body = cb_text + f"\n\n✓ Selected: `{label_for_value}`"
@@ -542,17 +552,48 @@ def _tg_poll_loop(token: str, chat_id: int, config: dict) -> str:
                     slash_cb = session_ctx.handle_slash
                     if slash_cb:
                         def _slash_runner(_slash_text, _token, _chat_id):
+                            import io as _io, sys as _sys, re as _re_ansi
                             _tg_thread_local.active = True
+                            # Capture print()/info()/ok()/warn()/err() output so
+                            # commands like /help (which render their menu via
+                            # print) surface in the chat instead of disappearing
+                            # into the server log (issue #84 follow-up).
+                            _buf_out, _buf_err = _io.StringIO(), _io.StringIO()
+                            _orig_out, _orig_err = _sys.stdout, _sys.stderr
+                            class _Tee:
+                                def __init__(self, *streams):
+                                    self._streams = streams
+                                def write(self, data):
+                                    for s in self._streams:
+                                        try: s.write(data)
+                                        except Exception: pass
+                                def flush(self):
+                                    for s in self._streams:
+                                        try: s.flush()
+                                        except Exception: pass
+                            _sys.stdout = _Tee(_orig_out, _buf_out)
+                            _sys.stderr = _Tee(_orig_err, _buf_err)
                             try:
                                 cmd_type = slash_cb(_slash_text)
                             except Exception as e:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _tg_send(_token, _chat_id, f"⚠ Error: {e}")
                                 return
                             finally:
+                                _sys.stdout, _sys.stderr = _orig_out, _orig_err
                                 _tg_thread_local.active = False
+                            _captured = (_buf_out.getvalue() + _buf_err.getvalue())
+                            _captured = _re_ansi.sub(r'\x1b\[[0-9;]*m', '', _captured).strip()
                             if cmd_type == "simple":
                                 cmd_name = _slash_text.strip().split()[0]
-                                _tg_send(_token, _chat_id, f"✅ {cmd_name} executed.")
+                                # Forward the captured menu/status text so the
+                                # user actually sees /help, /status, /model
+                                # output.  Fall back to the bare ack only when
+                                # the command produced nothing.
+                                if _captured:
+                                    _tg_send(_token, _chat_id, _captured)
+                                else:
+                                    _tg_send(_token, _chat_id, f"✅ {cmd_name} executed.")
                                 return
                             tg_state = session_ctx.agent_state
                             if tg_state and tg_state.messages:
