@@ -721,6 +721,17 @@ Per-iteration behavior:
 - Wakes up on `stop_event.wait(interval)` — set `interval` small for
   active monitoring, large for batch work.
 
+**F-4 execution mode (subprocess, opt-in).** On POSIX, setting
+`CHEETAHCLAWS_ENABLE_F4=1` or `agent_runner_subprocess: true` flips
+`start_runner` from threading to subprocess-per-runner. Each runner
+becomes a `python -m agent_runner --pipe` child supervised by
+`cc_daemon.runner_supervisor`; iteration boundaries and crashes are
+observable on the daemon event bus and persisted to the `agent_runs`
+/ `agent_iterations` SQLite tables. The threaded path stays the
+default so REPL behaviour is byte-for-byte unchanged. See
+[RFC 0002 §F-4](RFC/0002-daemon-foundation-roadmap.md#f-4--agent_runner-subprocess)
+for the wire protocol and lifecycle.
+
 This is the closest thing the project has to a "7 × 24 agent"
 runtime today; see CONTRIBUTING.md for the current production-
 readiness gaps (daemon mode, SQLite session store, cost guardrails).
@@ -835,6 +846,34 @@ Added by the F-1 foundation:
   standalone health HTTP server and `cc_daemon/server.py` reuse the
   same circuit-breaker / quota / runtime-registry probes without
   starting a second listener.
+
+Added by the F-4 skeleton (subprocess-per-agent — branch `daemon/f-4`,
+[RFC 0002 §F-4](RFC/0002-daemon-foundation-roadmap.md#f-4--agent_runner-subprocess)):
+
+- `cc_daemon/runner_supervisor.py` — owns the lifecycle of one or more
+  `python -m agent_runner --pipe` subprocesses. `start` /
+  `stop` / `stop_all` / `get` / `list_all`. Three-phase stop bounded
+  ≤ 5 s (IPC `stop` → SIGTERM at 2 s → SIGKILL at 5 s). Per-runner
+  reader thread pumps `iteration_done` / `permission_request` / `log` /
+  `notify` IPC into the F-2 SQLite tables (`agent_runs` + `agent_iterations`)
+  and the F-2 event bus (`agent_runner_start` / `agent_iteration_done` /
+  `agent_runner_stopped` / `agent_runner_crash`). All DB writes are
+  best-effort; supervisor never crashes on persistence failure. POSIX
+  only (`enabled()` returns False on Windows).
+- `cc_daemon/runner_ipc.py` — thin re-export of
+  `cc_kernel.runner.ipc.JsonLineChannel` so both runner families share
+  one IPC implementation and one set of bug fixes.
+- `cc_daemon/agent_methods.py` — JSON-RPC handlers `agent.start`,
+  `agent.stop`, `agent.list`, `agent.status`, registered from
+  `DaemonState.__init__` alongside `system_methods` / `monitor_methods`.
+  Param validation raises `TypeError` so the dispatcher returns the
+  standard `-32602 INVALID_PARAMS` shape.
+- `agent_runner.py` — gains the `--pipe` subprocess entry point
+  (`_pipe_main` + `_PipeAgentRunner` subclass that swaps
+  `send_fn` / `_persist_record` to write IPC instead of in-process
+  callbacks). `start_runner` / `stop_runner` / `stop_all` dispatch on
+  `agent_runner_subprocess` config key (or `CHEETAHCLAWS_ENABLE_F4=1`
+  env var); default off — REPL stays threaded.
 
 **Wire surface (HTTP/1.1 over UDS or TCP).**
 
