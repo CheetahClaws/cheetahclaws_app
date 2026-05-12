@@ -28,6 +28,15 @@ cheetahclaws --web --model custom/qwen2.5-72b
 
 `--model` in `--web` mode is persisted to disk before the server starts, because every request handler reloads config from `~/.cheetahclaws/config.json`. To switch models without restarting, use the Settings panel in the Chat UI or send `/model <name>` in the message box.
 
+> **Prerequisite for `custom/<model>`.** The `custom/` provider is an OpenAI-compatible client with **no built-in base URL** — it always reads `CUSTOM_BASE_URL` (env var) or `custom_base_url` (in `~/.cheetahclaws/config.json`). If both are empty you'll get `ValueError: custom provider requires a base_url`. Quick setup before the launch line above:
+>
+> ```bash
+> export CUSTOM_BASE_URL=http://localhost:8000/v1   # don't forget the /v1 suffix
+> export CUSTOM_API_KEY=EMPTY                       # vLLM ignores it, but the OpenAI SDK needs a non-empty string
+> ```
+>
+> See [`recipes.md` → "Alternative: self-hosted vLLM …"](recipes.md#alternative-self-hosted-vllm-or-any-openai-compatible-endpoint-via-the-custom-provider) for the full vLLM walkthrough (server-side flags, tool-call parser, `/v1/models` discovery, troubleshooting table).
+
 Startup banner:
 
 ```
@@ -396,6 +405,24 @@ The log line is JSON with the full exception. Usually a file-permission issue on
 
 **Slash command output appears twice in the Chat UI but once in the terminal**
 Fixed (May 10, 2026). The chat client used to receive every synchronous slash-command event through both the HTTP `data.events` payload **and** the WS broadcast, so each reply rendered twice; the terminal has no parallel WS path so it always rendered once. If you see this on an older build, pull `web/api.py` from `main` — `handle_slash_sync` and `handle_slash_stream` no longer re-broadcast events to WS subscribers when a single-client response channel is already in use. See [Issue #111](https://github.com/SafeRL-Lab/cheetahclaws/issues/111).
+
+**`ValueError: custom provider requires a base_url. Set CUSTOM_BASE_URL env var or run: /config custom_base_url=http://...`**
+You launched with `--model custom/<name>` (e.g. against a local vLLM) but never told CheetahClaws where the server lives. The `custom/` provider has no default endpoint — it's a generic OpenAI-compatible client. Fix either way:
+
+```bash
+# Env-var form (one-shot for this terminal):
+export CUSTOM_BASE_URL=http://localhost:8000/v1   # /v1 suffix is mandatory
+export CUSTOM_API_KEY=EMPTY                       # any non-empty string; vLLM ignores it
+cheetahclaws --web --model custom/qwen2.5-72b
+
+# Persisted form (saved to ~/.cheetahclaws/config.json):
+cheetahclaws
+/config custom_base_url=http://localhost:8000/v1
+/config custom_api_key=EMPTY
+/model custom/qwen2.5-72b
+```
+
+Verify the server is actually reachable first: `curl http://localhost:8000/v1/models` should list the model whose name matches the suffix after `custom/`. Full walkthrough including vLLM launch flags and tool-call setup: [recipes.md → "Alternative: self-hosted vLLM …"](recipes.md#alternative-self-hosted-vllm-or-any-openai-compatible-endpoint-via-the-custom-provider).
 
 **`cheetahclaws --web --model X` runs but the agent calls a different model**
 Fixed (May 10, 2026). The CLI override branch only ran in the interactive-REPL path, so `--web` ignored `--model` and the per-request `load_config()` call kept using the previous saved value (typically the last model you ran in the REPL). Symptom: `404: model 'X' does not exist` against your `custom_base_url` even though the CLI argument names a different model. Pull from `main` so `args.model` is persisted to `~/.cheetahclaws/config.json` before `start_web_server` runs. Workaround on older builds: edit the config file directly, or use `/model custom/<name>` from the Chat UI.
