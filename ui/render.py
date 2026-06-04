@@ -185,14 +185,30 @@ def _live_line_limit() -> int:
 
 
 def _rendered_line_count(renderable) -> int:
-    """Estimate actual terminal lines after Rich wrapping / Markdown rendering."""
+    """Estimate actual terminal lines after Rich wrapping / Markdown rendering.
+
+    Fast path: a cheap per-line wrap estimate. When it has comfortable headroom
+    below the current limit we trust it and skip the expensive full render — so
+    the common case (responses that never approach the limit) avoids an O(n^2)
+    markdown re-render on every streamed chunk. Only responses nearing the limit
+    pay for `console.render_lines`, where the precise wrapped/Markdown line count
+    actually matters for the fallback decision.
+    """
     if not (_RICH and console is not None):
         return 0
+    source = renderable if isinstance(renderable, str) else getattr(renderable, "markup", "")
+    width = max(1, getattr(console, "width", 80) or 80)
+    # Per-line wrap estimate (each source line wraps into 1 + len//width rows).
+    cheap = sum(1 + len(line) // width for line in source.split("\n"))
+    # 2x headroom absorbs Markdown chrome (code-block borders, blank lines around
+    # headers/lists). Below it we're safely under the limit; no need to render.
+    if cheap * 2 < _live_line_limit():
+        return cheap
     try:
         lines = console.render_lines(renderable, console.options, pad=False)
         return len(lines)
     except Exception:
-        return 0
+        return cheap
 
 
 def _stop_live(clear: bool = False) -> None:

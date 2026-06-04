@@ -60,7 +60,7 @@ Generating diverse perspectives...
 - With many agents (20+) the session can take several minutes depending on model speed.
 - Install `faker` (`pip install faker`) for randomized persona names; falls back to built-in names otherwise.
 - Output files accumulate in `brainstorm_outputs/` — already added to `.gitignore` by v3.05.5.
-- If output looks garbled in SSH (repeated lines), run `/config rich_live=false` to disable Rich Live streaming.
+- Long responses now auto-fall back to plain streaming when they would overflow the terminal, so duplicate/stale lines are largely prevented automatically. If output still looks garbled in SSH (repeated lines), run `/config rich_live=false` to fully disable Rich Live streaming.
 
 ---
 
