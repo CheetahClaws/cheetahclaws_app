@@ -152,6 +152,7 @@ def _has_diff(text: str) -> bool:
 _accumulated_text: list[str] = []   # buffer text during streaming
 _current_live = None                # active Rich Live instance (one at a time)
 _RICH_LIVE = True                   # set False (via config rich_live=false) to disable
+_plain_streaming_response = False   # current response has fallen back from Live
 
 def set_rich_live(enabled: bool) -> None:
     """Called from repl.py to apply the rich_live config setting."""
@@ -175,36 +176,71 @@ def _start_live() -> None:
 _LIVE_LINE_LIMIT = 80  # auto-switch to plain streaming beyond this many lines
 
 
+def _live_line_limit() -> int:
+    """Return a conservative Live height limit for the current terminal."""
+    height = getattr(console, "height", 0) or 0
+    if height > 0:
+        return min(_LIVE_LINE_LIMIT, max(12, height - 4))
+    return _LIVE_LINE_LIMIT
+
+
+def _rendered_line_count(renderable) -> int:
+    """Estimate actual terminal lines after Rich wrapping / Markdown rendering."""
+    if not (_RICH and console is not None):
+        return 0
+    try:
+        lines = console.render_lines(renderable, console.options, pad=False)
+        return len(lines)
+    except Exception:
+        return 0
+
+
+def _stop_live(clear: bool = False) -> None:
+    """Stop the active Live renderer, optionally clearing its last frame first."""
+    global _current_live
+    if _current_live is None:
+        return
+    if clear:
+        try:
+            _current_live.update("", refresh=True)
+        except Exception:
+            pass
+    _current_live.stop()
+    _current_live = None
+
+
 def stream_text(chunk: str) -> None:
     """Buffer chunk; update Live in-place when Rich available, else print directly.
 
-    Safety: if accumulated text exceeds _LIVE_LINE_LIMIT lines, auto-switch
-    from Rich Live to plain streaming to prevent terminal re-render duplication
-    on terminals that can't handle large Live areas (macOS Terminal, etc.).
+    Safety: if accumulated text renders to too many terminal lines, auto-switch
+    from Rich Live to plain streaming for the rest of this response. Live
+    redraws the full accumulated output on every chunk; large wrapped output is
+    where terminal emulators commonly leave stale frames behind.
     """
-    global _current_live
+    global _current_live, _plain_streaming_response
+
+    if _plain_streaming_response:
+        print(chunk, end="", flush=True)
+        return
+
     _accumulated_text.append(chunk)
 
     if _RICH and _RICH_LIVE:
         full = "".join(_accumulated_text)
-        line_count = full.count("\n")
+        renderable = _make_renderable(full)
+        line_count = max(full.count("\n") + 1, _rendered_line_count(renderable))
 
         # Safety: too many lines → kill Live and fall back to plain streaming
-        if _current_live is not None and line_count > _LIVE_LINE_LIMIT:
-            _current_live.stop()
-            _current_live = None
-            # Print the full text once (Live already displayed partial content,
-            # but stopping Live clears it — so we re-print cleanly)
-            console.print(_make_renderable(full))
+        if line_count > _live_line_limit():
+            _stop_live(clear=True)
+            console.print(renderable)
+            _accumulated_text.clear()
+            _plain_streaming_response = True
             return
 
-        if line_count <= _LIVE_LINE_LIMIT:
-            if _current_live is None:
-                _start_live()
-            _current_live.update(_make_renderable(full), refresh=True)
-        else:
-            # Already past limit, no Live — just append new chunk
-            print(chunk, end="", flush=True)
+        if _current_live is None:
+            _start_live()
+        _current_live.update(renderable, refresh=True)
     else:
         print(chunk, end="", flush=True)
 
@@ -216,16 +252,16 @@ def stream_thinking(chunk: str, verbose: bool):
 
 def flush_response() -> None:
     """Commit buffered text to screen: stop Live (freezes rendered Markdown in place)."""
-    global _current_live
+    global _current_live, _plain_streaming_response
     full = "".join(_accumulated_text)
     _accumulated_text.clear()
     if _current_live is not None:
-        _current_live.stop()
-        _current_live = None
+        _stop_live()
     elif _RICH and _RICH_LIVE and full.strip():
         console.print(_make_renderable(full))
     else:
         print()  # ensure newline after plain-text stream
+    _plain_streaming_response = False
 
 
 # ── Spinner ────────────────────────────────────────────────────────────────
