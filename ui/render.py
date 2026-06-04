@@ -20,6 +20,7 @@ try:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.live import Live
+    from rich.segment import Segment, Segments
     _RICH = True
     console = Console()
 except ImportError:
@@ -27,6 +28,8 @@ except ImportError:
     console = None
     Live = None
     Markdown = None
+    Segment = None
+    Segments = None
 
 # ── ANSI helpers ───────────────────────────────────────────────────────────
 
@@ -153,6 +156,7 @@ _accumulated_text: list[str] = []   # buffer text during streaming
 _current_live = None                # active Rich Live instance (one at a time)
 _RICH_LIVE = True                   # set False (via config rich_live=false) to disable
 _plain_streaming_response = False   # current response has fallen back from Live
+_live_shows_full = False            # True when the live frame holds the whole response (not a tail window)
 
 def set_rich_live(enabled: bool) -> None:
     """Called from repl.py to apply the rich_live config setting."""
@@ -173,7 +177,7 @@ def _start_live() -> None:
                              vertical_overflow="visible")
         _current_live.start()
 
-_LIVE_LINE_LIMIT = 80  # auto-switch to plain streaming beyond this many lines
+_LIVE_LINE_LIMIT = 80  # cap on Live height; beyond this only a tail window is redrawn
 
 
 def _live_line_limit() -> int:
@@ -184,15 +188,59 @@ def _live_line_limit() -> int:
     return _LIVE_LINE_LIMIT
 
 
-def _rendered_line_count(renderable) -> int:
-    """Estimate actual terminal lines after Rich wrapping / Markdown rendering."""
+def _cheap_line_estimate(text: str) -> int:
+    """Fast per-line wrap estimate (each source line wraps into 1 + len//width
+    rows). Used as a cheap gate so short responses skip the precise render."""
+    width = max(1, getattr(console, "width", 80) or 80)
+    return sum(1 + len(line) // width for line in text.split("\n"))
+
+
+def _render_to_lines(renderable):
+    """Precisely render to terminal lines (wrap- / Markdown-aware), or None on
+    failure. Returns a list of segment-lines from `console.render_lines`."""
     if not (_RICH and console is not None):
-        return 0
+        return None
     try:
-        lines = console.render_lines(renderable, console.options, pad=False)
-        return len(lines)
+        return console.render_lines(renderable, console.options, pad=False)
     except Exception:
-        return 0
+        return None
+
+
+def _lines_renderable(lines):
+    """Wrap a slice of rendered segment-lines back into a Live-updatable
+    renderable (used to display only the tail window of a long response)."""
+    segments = []
+    for i, line in enumerate(lines):
+        if i:
+            segments.append(Segment.line())
+        segments.extend(line)
+    return Segments(segments)
+
+
+def _live_update(renderable, full: bool) -> None:
+    """Push a frame to the Live region, starting it if needed. `full` records
+    whether this frame shows the entire response or just a tail window, so
+    flush_response knows whether it must re-commit the complete output."""
+    global _live_shows_full
+    if _current_live is None:
+        _start_live()
+    if _current_live is None:
+        # _start_live() no-ops if Live was disabled concurrently; bail rather than
+        # dereference None. Defensive only — the single-threaded path never hits it.
+        return
+    _live_shows_full = full
+    _current_live.update(renderable, refresh=True)
+
+
+def _fall_back_to_plain(renderable) -> None:
+    """Stop/clear Live and switch this response to plain streaming. Used only as
+    a safety net (precise render failed, or terminal too small to bound a Live
+    window) — the tail-window path below normally keeps Live active."""
+    global _plain_streaming_response
+    _stop_live(clear=True)
+    console.print(renderable)
+    _accumulated_text.clear()
+    _plain_streaming_response = True
 
 
 def _stop_live(clear: bool = False) -> None:
@@ -212,37 +260,61 @@ def _stop_live(clear: bool = False) -> None:
 def stream_text(chunk: str) -> None:
     """Buffer chunk; update Live in-place when Rich available, else print directly.
 
-    Safety: if accumulated text renders to too many terminal lines, auto-switch
-    from Rich Live to plain streaming for the rest of this response. Live
-    redraws the full accumulated output on every chunk; large wrapped output is
-    where terminal emulators commonly leave stale frames behind.
-    """
-    global _current_live, _plain_streaming_response
+    Live's in-place redraw moves the cursor up over the previous frame, which only
+    works while that frame fits the viewport. Once the full response would render
+    past the terminal height it scrolls into the scrollback the cursor can't reach,
+    leaving stale/duplicate frames. To stay correct we keep the Live region bounded:
+    a short response is shown in full, but once it would overflow we render the whole
+    thing and feed Live only the **last `limit` lines** (a tail window that always
+    fits). The complete output is committed once in flush_response(). Plain streaming
+    is kept only as a safety net (precise render failed, or terminal too small).
 
+    Tradeoff: while a long response streams in tail-window mode only its most recent
+    screenful is visible; the start scrolls out of the Live region and is not yet in
+    the scrollback. It is re-committed in full when the response finishes — including
+    on Ctrl-C, since the REPL flushes on interrupt — so nothing is ever lost, it is
+    just not visible live until completion.
+    """
     if _plain_streaming_response:
         print(chunk, end="", flush=True)
         return
 
     _accumulated_text.append(chunk)
 
-    if _RICH and _RICH_LIVE:
-        full = "".join(_accumulated_text)
-        renderable = _make_renderable(full)
-        line_count = max(full.count("\n") + 1, _rendered_line_count(renderable))
-
-        # Safety: too many lines → kill Live and fall back to plain streaming
-        if line_count > _live_line_limit():
-            _stop_live(clear=True)
-            console.print(renderable)
-            _accumulated_text.clear()
-            _plain_streaming_response = True
-            return
-
-        if _current_live is None:
-            _start_live()
-        _current_live.update(renderable, refresh=True)
-    else:
+    if not (_RICH and _RICH_LIVE):
         print(chunk, end="", flush=True)
+        return
+
+    full = "".join(_accumulated_text)
+    renderable = _make_renderable(full)
+    limit = _live_line_limit()
+    height = getattr(console, "height", 0) or 0
+
+    # Can't bound a Live window inside the viewport (unknown / tiny terminal) →
+    # plain streaming is the only redraw-free option.
+    if not height or limit > height:
+        _fall_back_to_plain(renderable)
+        return
+
+    # Fast path: only when the cheap estimate is so far under the limit that even
+    # worst-case Markdown expansion (tables add border rows, blocks add blank lines)
+    # cannot overflow the viewport. Correctness must not hinge on this estimate, so
+    # the 3x margin is deliberately conservative — anything closer to the limit takes
+    # the precise path below, which decides full vs tail window on real line counts.
+    if _cheap_line_estimate(full) * 3 < limit:
+        _live_update(renderable, full=True)
+        return
+
+    # Near/over the limit → render precisely to choose full vs tail window.
+    lines = _render_to_lines(renderable)
+    if lines is None:
+        _fall_back_to_plain(renderable)
+    elif len(lines) <= limit:
+        _live_update(renderable, full=True)
+    else:
+        # Tail window: only ever redraw the last `limit` rendered lines, so the
+        # Live region never exceeds the viewport and cannot leave stale frames.
+        _live_update(_lines_renderable(lines[-limit:]), full=False)
 
 def stream_thinking(chunk: str, verbose: bool):
     if verbose:
@@ -251,16 +323,24 @@ def stream_thinking(chunk: str, verbose: bool):
             print(f"{C['dim']}{clean_chunk}", end="", flush=True)
 
 def flush_response() -> None:
-    """Commit buffered text to screen: stop Live (freezes rendered Markdown in place)."""
-    global _current_live, _plain_streaming_response
+    """Commit buffered text to screen, then reset per-response streaming state."""
+    global _plain_streaming_response, _live_shows_full
     full = "".join(_accumulated_text)
     _accumulated_text.clear()
     if _current_live is not None:
-        _stop_live()
+        if _live_shows_full:
+            # Live already holds the complete rendered output — freeze it in place.
+            _stop_live()
+        else:
+            # Live only shows a tail window — clear it and commit the full output.
+            _stop_live(clear=True)
+            if _RICH and _RICH_LIVE and full.strip():
+                console.print(_make_renderable(full))
     elif _RICH and _RICH_LIVE and full.strip():
         console.print(_make_renderable(full))
     else:
         print()  # ensure newline after plain-text stream
+    _live_shows_full = False
     _plain_streaming_response = False
 
 

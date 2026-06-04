@@ -332,7 +332,7 @@ Claude Code is a powerful, production-grade AI coding assistant — but its sour
 | Vision input | `/image` (or `/img`) captures the clipboard image and sends it to any vision-capable model — Ollama (`llava`, `gemma4`, `llama3.2-vision`) via native format, or cloud models (GPT-4o, Gemini 2.0 Flash, …) via OpenAI `image_url` multipart format. Requires `pip install cheetahclaws[vision]`; Linux also needs `xclip`. |
 | Proactive monitoring | `/proactive [duration]` starts a background sentinel daemon; agent wakes automatically after inactivity, enabling continuous monitoring loops without user prompts |
 | Force quit | 3× Ctrl+C within 2 seconds triggers `os._exit(1)` — kills the process immediately regardless of blocking I/O |
-| Rich Live streaming | When `rich` is installed, responses render as live-updating Markdown in place. Auto-disabled in SSH sessions to prevent repeated output; override with `/config rich_live=false`. |
+| Rich Live streaming | When `rich` is installed, responses render as live-updating Markdown in place. Long responses that would overflow the terminal keep rendering live but show only the most recent screenful (a bounded tail window, terminal-height / wrap aware); the complete output is committed when the response finishes, preventing the duplicate or stale frames some terminals leave behind. Plain streaming is used only as a fallback. Auto-disabled in SSH sessions; override with `/config rich_live=false`. |
 | Context injection | Auto-loads `CLAUDE.md`, git status, cwd, persistent memory |
 | Session persistence | Autosave on exit to `daily/YYYY-MM-DD/` (per-day limit) + `history.json` (master, all sessions) + `session_latest.json` (/resume); sessions include `session_id` and `saved_at` metadata; `/load` grouped by date |
 | Cloud sync | `/cloudsave` syncs sessions to private GitHub Gists; auto-sync on exit; load from cloud by Gist ID. No new dependencies (stdlib `urllib`). |
@@ -1666,7 +1666,7 @@ Generating diverse perspectives...
 - With many agents (20+) the session can take several minutes depending on model speed.
 - Install `faker` (`pip install faker`) for randomized persona names; falls back to built-in names otherwise.
 - Output files accumulate in `brainstorm_outputs/` — already added to `.gitignore` by v3.05.5.
-- If output looks garbled in SSH (repeated lines), run `/config rich_live=false` to disable Rich Live streaming.
+- Long responses keep rendering live but show only the most recent screenful (a bounded tail window) until they finish, so duplicate/stale lines are prevented automatically. If output still looks garbled in SSH (repeated lines), run `/config rich_live=false` to fully disable Rich Live streaming.
 
 ---
 

@@ -330,7 +330,7 @@ Claude Code es un potente asistente de programación con IA listo para producci�
 | Entrada de visión | `/image` (o `/img`) captura la imagen del portapapeles y la envía a cualquier modelo con capacidad de visión — Ollama (`llava`, `gemma4`, `llama3.2-vision`) mediante formato nativo, o modelos en la nube (GPT-4o, Gemini 2.0 Flash, …) mediante formato OpenAI `image_url` multipart. Requiere `pip install cheetahclaws[vision]`; en Linux también necesita `xclip`. |
 | Monitoreo proactivo | `/proactive [duration]` inicia un daemon centinela en segundo plano; el agente despierta automáticamente tras inactividad, permitiendo bucles continuos de monitoreo sin prompts del usuario |
 | Cierre forzado | 3× Ctrl+C en 2 segundos activa `os._exit(1)` — mata el proceso inmediatamente sin importar bloqueos de E/S |
-| Streaming Live con Rich | Cuando `rich` está instalado, las respuestas se muestran como Markdown que se actualiza en vivo. Se desactiva automáticamente en sesiones SSH para evitar salida repetida; puedes forzarlo con `/config rich_live=false`. |
+| Streaming Live con Rich | Cuando `rich` está instalado, las respuestas se muestran como Markdown que se actualiza en vivo. Las respuestas largas que desbordarían la terminal siguen renderizándose en vivo pero solo muestran la última pantalla (una «ventana de cola» acotada, que tiene en cuenta la altura de la terminal y el ajuste de línea); la salida completa se confirma al terminar la respuesta, evitando los fotogramas duplicados u obsoletos que algunas terminales dejan. El streaming de texto plano se usa solo como respaldo. Se desactiva automáticamente en sesiones SSH; puedes forzarlo con `/config rich_live=false`. |
 | Inyección de contexto | Carga automáticamente `CLAUDE.md`, estado git, cwd, memoria persistente |
 | Persistencia de sesión | Autoguardado al salir en `daily/YYYY-MM-DD/` (límite por día) + `history.json` (maestro, todas las sesiones) + `session_latest.json` (`/resume`); las sesiones incluyen metadatos `session_id` y `saved_at`; `/load` agrupado por fecha |
 | Sincronización en la nube | `/cloudsave` sincroniza sesiones con Gists privados de GitHub; auto-sync al salir; carga desde la nube por Gist ID. Sin nuevas dependencias (stdlib `urllib`). |
@@ -1665,7 +1665,7 @@ Generando perspectivas diversas...
 - Con muchos agentes (20+) la sesión puede tardar varios minutos según la velocidad del modelo.
 - Instala `faker` (`pip install faker`) para nombres de persona aleatorios; si no, usa nombres integrados.
 - Los archivos de salida se acumulan en `brainstorm_outputs/`; desde v3.05.5 ya está añadido a `.gitignore`.
-- Si la salida se ve corrupta en SSH (líneas repetidas), ejecuta `/config rich_live=false` para desactivar Rich Live streaming.
+- Las respuestas largas siguen renderizándose en vivo pero solo muestran la última pantalla (una ventana de cola acotada) hasta que terminan, por lo que las líneas duplicadas/obsoletas se evitan automáticamente. Si la salida aún se ve corrupta en SSH (líneas repetidas), ejecuta `/config rich_live=false` para desactivar por completo Rich Live streaming.
 
 ---
 
