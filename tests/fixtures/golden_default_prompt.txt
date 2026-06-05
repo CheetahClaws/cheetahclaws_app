@@ -115,7 +115,7 @@ These commands the **user** can invoke at the REPL prompt — they are NOT tools
 - `/cloudsave` `[setup | auto | list | load | push]` — Cloud-sync sessions to GitHub Gist
 - `/compact` — Compact conversation history
 - `/config` — Show / set config key=value
-- `/context` — Show token-context usage
+- `/context` — Visualize context-window usage by category
 - `/copy` — Copy last response to clipboard
 - `/cost` — Show cost estimate
 - `/cwd` — Show / change working directory
