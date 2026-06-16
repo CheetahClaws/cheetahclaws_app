@@ -40,6 +40,7 @@ async function createWindow() {
     backgroundColor: '#0b0f14',
     title: 'CheetahClaws',
     autoHideMenuBar: true,
+    icon: path.join(__dirname, '..', 'assets', 'icon.png'),
     webPreferences: {
       // The window loads our own localhost server; keep Node out of the
       // renderer and isolate contexts (Electron security defaults).
