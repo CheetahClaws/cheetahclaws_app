@@ -9,6 +9,7 @@
   "scripts": {
     "start": "electron .",
     "smoke": "node test/sidecar.smoke.js",
+    "fix-electron": "node scripts/fix-electron.mjs",
     "dist": "electron-builder"
   },
   "devDependencies": {

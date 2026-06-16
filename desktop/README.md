@@ -52,6 +52,38 @@ Verify just the sidecar wiring (no GUI, no Electron needed):
 npm run smoke      # DEBUG=1 npm run smoke  to echo server logs
 ```
 
+## Troubleshooting `npm install` / `npm start`
+
+The Electron npm package only downloads its ~90 MB binary in a `postinstall`
+script. On hardened-npm setups (`allow-scripts`), very new Node versions, or
+slow/blocked networks, that step misbehaves. Symptoms and fixes:
+
+- **`Electron failed to install correctly`** — the binary didn't download or
+  `path.txt` wasn't written. First make sure the binary is present, using a
+  China-friendly mirror:
+  ```bash
+  rm -rf node_modules/electron ~/Library/Caches/electron      # (Linux: ~/.cache/electron)
+  ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ \
+    npm install electron --foreground-scripts
+  npm run fix-electron        # writes the correct path.txt
+  npm start
+  ```
+- **`spawn .../dist/dist/Electron.app/... ENOENT` (double `dist`)** — `path.txt`
+  has a stray `dist/` prefix. `npm run fix-electron` rewrites it correctly
+  (Electron expects the path *relative to* `dist/`).
+- **Extraction left a tiny/partial `dist/`** — download the full zip yourself
+  from <https://npmmirror.com/mirrors/electron/> (match your platform + arch,
+  e.g. `electron-vXX-darwin-arm64.zip`), unzip into `node_modules/electron/dist/`,
+  then `npm run fix-electron`.
+- **macOS "Electron is damaged / cannot be verified"** — clear the quarantine
+  flag on the dev binary: `xattr -dr com.apple.quarantine node_modules/electron/dist/Electron.app`.
+- **Node version** — Electron 31 is happiest on an LTS Node (18/20). Bleeding-edge
+  Node has been seen to skip writing `path.txt`; `npm run fix-electron` papers
+  over that, or use `nvm use 20`.
+
+None of this affects **end users** — a packaged `.dmg`/`.exe`/`.AppImage`
+(below) bundles Electron, so installers never hit the postinstall path.
+
 ## Package a distributable (later)
 
 `npm run dist` (electron-builder) produces a DMG / NSIS / AppImage. **But note
