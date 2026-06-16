@@ -22,6 +22,12 @@
     "files": [
       "src/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "server/dist/cheetahclaws-server",
+        "to": "server"
+      }
+    ],
     "directories": {
       "output": "out"
     },

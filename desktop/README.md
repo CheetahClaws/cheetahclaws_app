@@ -22,11 +22,16 @@ scope for P1.
 
 ## Status
 
-- ✅ **Sidecar integration is verified** — `npm run smoke` launches the real
+- ✅ **Runs end-to-end on macOS** — the Electron shell launches the server,
+  discovers its port, and loads the chat UI in a native window.
+- ✅ **Sidecar integration verified** — `npm run smoke` launches the real
   server, discovers its port, and confirms `/chat`, `/`, `/health` all serve.
-  This is the load-bearing part and it works.
-- ⛏️ The Electron window code (`src/main.js`) is written but needs a machine
-  with a display to run/build (this was developed headless).
+- ✅ **Self-contained server verified** — `scripts/build-server.sh` freezes the
+  server with PyInstaller into a ~95 MB standalone binary that serves the full
+  web UI with **no Python installed**; the sidecar drives it identically. So a
+  packaged installer needs neither Node nor Python on the user's machine.
+- ⛏️ **Remaining for a shippable installer:** code signing / notarization (see
+  open items) — everything else is wired and tested.
 
 ## Prerequisites
 
@@ -84,24 +89,49 @@ slow/blocked networks, that step misbehaves. Symptoms and fixes:
 None of this affects **end users** — a packaged `.dmg`/`.exe`/`.AppImage`
 (below) bundles Electron, so installers never hit the postinstall path.
 
-## Package a distributable (later)
+## Build a self-contained installer (.dmg / .exe / .AppImage)
 
-`npm run dist` (electron-builder) produces a DMG / NSIS / AppImage. **But note
-the open item below before shipping.**
+This produces an installer that bundles **both** Electron and a
+PyInstaller-frozen copy of the server, so the **end user needs neither Node nor
+Python** — they just double-click.
 
-## Known open items (next steps, not done in this MVP)
+```bash
+cd desktop
+bash scripts/build-app.sh
+# → out/  contains the .dmg (macOS) / .exe (Windows) / .AppImage (Linux)
+```
 
-1. **Bundle the Python sidecar.** Today the app assumes `cheetahclaws[web]` is
-   pip-installed and on PATH. To ship to non-Python users, freeze the server
-   with PyInstaller/Nuitka and spawn the bundled binary instead of the global
-   `cheetahclaws`. Define a lean `core` install profile first (agent + web UI;
-   trading/voice/video optional) so the bundle stays small.
-2. **Code signing + notarization.** macOS Gatekeeper / Windows SmartScreen will
-   block an unsigned build. Real (paid) prerequisite for public distribution.
-3. **First-run onboarding.** A GUI provider/API-key step (the CLI's setup
+What it does, in order:
+
+1. **`scripts/build-server.sh`** — freezes `cheetahclaws --web` with PyInstaller
+   in a *clean* virtualenv (only the core + `[web]` deps, so the bundle is
+   ~95 MB, not GBs — the trading/voice/research stacks aren't installed and the
+   modular loaders skip them gracefully). Output:
+   `server/dist/cheetahclaws-server/`.
+2. **`electron-builder`** (`npm run dist`) — packages the Electron shell and
+   copies the frozen server into the app's `Resources/server/` (see
+   `build.extraResources`). At runtime `src/main.js` spawns
+   `Resources/server/cheetahclaws-server` when packaged, falling back to the
+   global `cheetahclaws` CLI in dev.
+
+> **PyInstaller does not cross-compile** — run `build-app.sh` *on each target
+> OS*: a Mac to get the `.dmg`, Windows to get the `.exe`. (The whole server +
+> sidecar pipeline is verified on Linux; only the per-OS packaging differs.)
+
+## Known open items (next steps)
+
+1. **Code signing + notarization.** macOS Gatekeeper / Windows SmartScreen will
+   block an unsigned build (users get "damaged / unverified developer"). Needs
+   an Apple Developer cert (`CSC_LINK`/`CSC_KEY_PASSWORD` + `notarize` in
+   electron-builder) and a Windows code-signing cert. Paid prerequisite for
+   public distribution — the only thing between `build-app.sh` and a
+   shippable installer.
+2. **First-run onboarding.** A GUI provider/API-key step (the CLI's setup
    wizard, as a screen) — the main lever for reaching non-CLI users.
-4. **Auto-update.** Wire electron-updater (or Tauri's updater) so users don't
+3. **Auto-update.** Wire electron-updater (or Tauri's updater) so users don't
    stay pinned to old builds.
+4. **Slim the server further (optional).** 95 MB is fine; if you want smaller,
+   `strip`/UPX the binary or prune more stdlib via the spec's `excludes`.
 
 ## Why Electron here (and Tauri later)
 

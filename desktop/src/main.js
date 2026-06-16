@@ -16,6 +16,21 @@ const { startSidecar } = require('./sidecar');
 let mainWindow = null;
 let sidecar = null;
 
+// Where to find the CheetahClaws server:
+//   - $CHEETAHCLAWS_BIN wins (explicit override, handy for dev).
+//   - A packaged app ships the PyInstaller-frozen server under Resources/server
+//     (see build/extraResources) — no Python needed on the user's machine.
+//   - In dev (npm start) we fall back to the pip-installed `cheetahclaws` CLI.
+function resolveServerCommand() {
+  if (process.env.CHEETAHCLAWS_BIN) return process.env.CHEETAHCLAWS_BIN;
+  if (app.isPackaged) {
+    const exe = process.platform === 'win32'
+      ? 'cheetahclaws-server.exe' : 'cheetahclaws-server';
+    return path.join(process.resourcesPath, 'server', exe);
+  }
+  return 'cheetahclaws';
+}
+
 async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -38,6 +53,7 @@ async function createWindow() {
 
   try {
     sidecar = await startSidecar({
+      command: resolveServerCommand(),
       onLog: (line) => console.log('[cheetahclaws]', line),
     });
   } catch (err) {
