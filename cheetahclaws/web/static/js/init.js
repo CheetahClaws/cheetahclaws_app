@@ -4,7 +4,7 @@
 const app = new ChatApp();
 app.initTheme();
 app.bootstrap();
-app._showWelcome();
+app._maybeOnboard();   // first-run provider/key setup, else the welcome dash
 
 const promptInput = document.getElementById('prompt-input');
 promptInput.addEventListener('keydown', (e) => {

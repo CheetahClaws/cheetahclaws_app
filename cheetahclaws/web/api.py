@@ -64,7 +64,7 @@ def _get_web_commands() -> dict:
             ("export", "cmd_export"), ("copy", "cmd_copy"),
             ("doctor", "cmd_doctor"), ("init", "cmd_init"),
             ("proactive", "cmd_proactive"), ("image", "cmd_image"),
-            ("img", "cmd_image"),
+            ("img", "cmd_image"), ("budget", "cmd_budget"),
         ]),
         ("commands.session", [
             ("save", "cmd_save"), ("load", "cmd_load"),
@@ -83,6 +83,7 @@ def _get_web_commands() -> dict:
             ("memory", "cmd_memory"), ("agents", "cmd_agents"),
             ("mcp", "cmd_mcp"), ("plugin", "cmd_plugin"),
             ("tasks", "cmd_tasks"), ("task", "cmd_tasks"),
+            ("draft", "cmd_draft"), ("summarize", "cmd_summarize"),
         ]),
         ("commands.checkpoint_plan", [
             ("plan", "cmd_plan"), ("checkpoint", "cmd_checkpoint"),
@@ -880,6 +881,22 @@ class ChatSession:
             get_logger("api").exception("config persist failed",
                                          extra={"session_id": self.session_id,
                                                 "err": str(exc)})
+        # Single-user (--no-auth, i.e. the desktop app) — persist EVERYTHING,
+        # including API keys, to ~/.cheetahclaws/config.json so the next launch
+        # remembers them (no re-onboarding). Multi-user web mode deliberately
+        # keeps secrets session-only, so this is gated on no-auth.
+        try:
+            from cheetahclaws.web import server as _srv
+            if getattr(_srv, "_server_no_auth", False):
+                from cheetahclaws.config import load_config, save_config
+                base = load_config()
+                base.update({k: v for k, v in updates.items()
+                             if k in _WRITABLE_CONFIG_KEYS})
+                save_config(base)
+        except Exception as exc:  # noqa: BLE001
+            from cheetahclaws.web.logging_setup import get_logger
+            get_logger("api").exception("config disk-persist failed",
+                                         extra={"err": str(exc)})
         return self.get_safe_config()
 
     def is_idle(self) -> bool:
