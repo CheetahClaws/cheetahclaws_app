@@ -3,6 +3,7 @@
 
 const app = new ChatApp();
 app.initTheme();
+app._initProfile();    // instant sidebar identity from the cached profile
 app.bootstrap();
 app._maybeOnboard();   // first-run provider/key setup, else the welcome dash
 

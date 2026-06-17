@@ -153,11 +153,14 @@ _SAFE_CONFIG_KEYS = frozenset({
     "model", "permission_mode", "max_tokens", "verbose", "thinking",
     "thinking_budget", "max_tool_output", "max_agent_depth",
     "shell_policy", "log_level",
+    # User profile (non-secret; safe to return + persist)
+    "profile_name", "profile_email", "profile_avatar",
 })
 
 _WRITABLE_CONFIG_KEYS = frozenset({
     "model", "permission_mode", "verbose", "thinking",
     "thinking_budget", "max_tokens",
+    "profile_name", "profile_email", "profile_avatar",
     # API keys — written to session config only, not persisted to disk
     "anthropic_api_key", "openai_api_key", "gemini_api_key",
     "kimi_api_key", "qwen_api_key", "zhipu_api_key",

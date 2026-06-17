@@ -88,6 +88,7 @@ Object.assign(ChatApp.prototype, {
         const r = await this._fetchAuth(`/api/config?sid=${this.sessionId}`);
         const cfg = await r.json();
         this._renderConfig(cfg);
+        if (this._applyProfile) this._applyProfile(cfg);
       } catch(e) { console.error('loadSettings:', e); }
     }
     try {

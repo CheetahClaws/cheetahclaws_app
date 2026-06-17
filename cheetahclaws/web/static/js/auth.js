@@ -18,6 +18,9 @@ Object.assign(ChatApp.prototype, {
       if (d.no_auth) {
         this._authed = true;
         this._hideLogin();
+        // Single-user (desktop) — no accounts, so "Sign out" is meaningless.
+        const so = document.getElementById('signout-btn');
+        if (so) so.style.display = 'none';
         await this.whoami();
         this.loadSessions();
         return;

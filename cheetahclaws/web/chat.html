@@ -256,6 +256,32 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
   font-size:12px; padding:2px 4px;
 }
 #sidebar-foot .link-btn:hover { text-decoration:underline; }
+/* sidebar identity (avatar + name → opens settings/profile) */
+.sidebar-user {
+  display:flex; align-items:center; gap:8px; min-width:0; flex:1;
+  background:none; border:none; cursor:pointer; padding:4px 6px;
+  border-radius:var(--radius-sm); color:var(--text); text-align:left;
+}
+.sidebar-user:hover { background:var(--panel); }
+.su-avatar {
+  width:24px; height:24px; border-radius:50%; flex-shrink:0;
+  background:var(--accent); color:#000; font-weight:700; font-size:12px;
+  display:flex; align-items:center; justify-content:center; overflow:hidden;
+  background-size:cover; background-position:center;
+}
+.su-name { font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* profile section in settings */
+.profile-row { display:flex; align-items:center; gap:14px; }
+.profile-avatar {
+  width:56px; height:56px; border-radius:50%; flex-shrink:0;
+  background:var(--accent); color:#000; font-weight:700; font-size:24px;
+  display:flex; align-items:center; justify-content:center; cursor:pointer;
+  border:2px solid var(--border); overflow:hidden;
+  background-size:cover; background-position:center; transition:filter .15s;
+}
+.profile-avatar:hover { filter:brightness(.93); }
+.profile-fields { display:flex; flex-direction:column; gap:8px; flex:1; min-width:0; }
+.profile-fields .sp-input { width:100%; box-sizing:border-box; }
 
 #sess-menu .menu-item {
   padding:7px 12px; cursor:pointer; border-radius:4px; color:var(--text);
@@ -620,8 +646,12 @@ body.resizing { cursor:col-resize; user-select:none; }
   <div id="session-list"></div>
   <div id="batch-bar" style="display:none"></div>
   <div id="sidebar-foot">
-    <span id="sidebar-user">—</span>
-    <button class="link-btn" onclick="app.logout()" title="Sign out">Sign out</button>
+    <button id="sidebar-user" class="sidebar-user" onclick="app.toggleSettings()"
+            title="Profile &amp; settings">
+      <span class="su-avatar" id="su-avatar"></span>
+      <span class="su-name" id="su-name">Profile</span>
+    </button>
+    <button class="link-btn" id="signout-btn" onclick="app.logout()" title="Sign out">Sign out</button>
   </div>
 </aside>
 
@@ -664,6 +694,23 @@ body.resizing { cursor:col-resize; user-select:none; }
   <div class="sp-hdr">
     <h3>Settings</h3>
     <button class="sp-close" onclick="app.toggleSettings()">&times;</button>
+  </div>
+
+  <!-- Profile -->
+  <div class="sp-section">
+    <h4>Profile</h4>
+    <div class="profile-row">
+      <button id="profile-avatar" class="profile-avatar" title="Change avatar"
+              onclick="document.getElementById('profile-avatar-file').click()"></button>
+      <input type="file" id="profile-avatar-file" accept="image/*" hidden
+             onchange="app.onAvatarFile(this.files[0])">
+      <div class="profile-fields">
+        <input id="profile-name" class="sp-input" placeholder="Display name" maxlength="40"
+               onchange="app.updateConfig('profile_name', this.value.trim()); app._afterProfileSave()">
+        <input id="profile-email" class="sp-input" type="email" placeholder="Email (optional)" maxlength="120"
+               onchange="app.updateConfig('profile_email', this.value.trim())">
+      </div>
+    </div>
   </div>
 
   <!-- Model Selection -->
@@ -746,6 +793,7 @@ body.resizing { cursor:col-resize; user-select:none; }
 <script src="/static/js/settings.js"></script>
 <script src="/static/js/welcome.js"></script>
 <script src="/static/js/onboarding.js"></script>
+<script src="/static/js/profile.js"></script>
 <script src="/static/js/init.js"></script>
 
 </body>
