@@ -71,11 +71,12 @@ Object.assign(ChatApp.prototype, {
     }
     const url = this._authMode === 'register'
       ? '/api/auth/register' : '/api/auth/login';
+    const remember = !!(document.getElementById('login-remember') || {}).checked;
     try {
       const r = await fetch(url, {
         method: 'POST', credentials: 'same-origin',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({username, password}),
+        body: JSON.stringify({username, password, remember}),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) { errEl.textContent = d.error || 'Auth failed'; return; }

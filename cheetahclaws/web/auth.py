@@ -39,7 +39,8 @@ except ImportError as exc:  # pragma: no cover
 _BCRYPT_MAX_BYTES = 72
 
 JWT_ALG = "HS256"
-JWT_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+JWT_TTL_SECONDS = 7 * 24 * 3600        # 7 days (default session)
+REMEMBER_TTL_SECONDS = 30 * 24 * 3600  # 30 days ("stay signed in")
 
 _SECRET_PATH = Path.home() / ".cheetahclaws" / "web_secret"
 
@@ -130,13 +131,13 @@ def verify_password(password: str, hashed: str) -> bool:
 
 # ── JWT ──────────────────────────────────────────────────────────────────
 
-def issue_token(user_id: int, username: str) -> str:
+def issue_token(user_id: int, username: str, ttl: int = JWT_TTL_SECONDS) -> str:
     now = int(time.time())
     payload = {
         "sub": str(user_id),
         "usr": username,
         "iat": now,
-        "exp": now + JWT_TTL_SECONDS,
+        "exp": now + ttl,
     }
     return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
 

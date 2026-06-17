@@ -73,6 +73,18 @@ Object.assign(ChatApp.prototype, {
     });
   },
 
+  // Override auth.js's footer renderer so logging in/out doesn't clobber the
+  // avatar+name markup. Profile name wins; the auth username is the fallback.
+  _renderUserFoot() {
+    let cached = {};
+    try { cached = JSON.parse(localStorage.getItem('cc-profile') || '{}'); } catch (_) {}
+    const name = (String(cached.profile_name || '').trim())
+      || (this._user && this._user.username) || '';
+    this._renderAvatarEl(document.getElementById('su-avatar'), name, cached.profile_avatar);
+    const sn = document.getElementById('su-name');
+    if (sn) sn.textContent = name || 'Profile';
+  },
+
   // Re-sync the sidebar after a name edit (the input's onchange already saved).
   _afterProfileSave() {
     let cached = {};

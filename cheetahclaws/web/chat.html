@@ -282,6 +282,45 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
 .profile-avatar:hover { filter:brightness(.93); }
 .profile-fields { display:flex; flex-direction:column; gap:8px; flex:1; min-width:0; }
 .profile-fields .sp-input { width:100%; box-sizing:border-box; }
+/* ── Login / auth ──────────────────────────────────────────────── */
+.login-overlay {
+  position:fixed; inset:0; z-index:300; font-family:var(--font);
+  align-items:center; justify-content:center;
+  background:radial-gradient(1200px 600px at 50% -10%, var(--panel), var(--bg) 60%);
+}
+.login-card {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius-lg); padding:32px 28px; width:340px; max-width:88vw;
+  text-align:center; box-shadow:var(--shadow-md);
+}
+.login-logo {
+  width:64px; height:64px; margin:0 auto 14px; border-radius:18px;
+  background:var(--accent-dim); display:flex; align-items:center; justify-content:center;
+  font-size:34px;
+}
+.login-title { color:var(--accent); font-size:1.3rem; font-weight:700; margin:0; }
+.login-sub { color:var(--text-dim); font-size:.82rem; margin:6px 0 18px; }
+.login-input {
+  width:100%; box-sizing:border-box; padding:11px 14px; margin-bottom:10px;
+  background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+  color:var(--text); font-size:.95rem; outline:none; transition:border-color .15s, box-shadow .15s;
+}
+.login-input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+.login-remember {
+  display:flex; align-items:center; gap:8px; justify-content:flex-start;
+  font-size:.82rem; color:var(--text-dim); margin:2px 0 16px; cursor:pointer;
+}
+.login-remember input { accent-color:var(--accent); }
+.login-btn {
+  width:100%; padding:11px 24px; border:none; border-radius:var(--radius);
+  background:var(--accent); color:#000; font-weight:700; font-size:.92rem; cursor:pointer;
+  transition:filter .12s; box-shadow:var(--shadow-sm);
+}
+.login-btn:hover { filter:brightness(1.06); }
+.login-err { color:var(--red); font-size:.85rem; margin-top:.6rem; min-height:1.2em; }
+.login-toggle { margin-top:.85rem; font-size:.8rem; }
+.login-toggle a { color:var(--accent); text-decoration:none; }
+.login-toggle a:hover { text-decoration:underline; }
 
 #sess-menu .menu-item {
   padding:7px 12px; cursor:pointer; border-radius:4px; color:var(--text);
@@ -601,28 +640,22 @@ body.resizing { cursor:col-resize; user-select:none; }
 <body>
 
 <!-- Login / register overlay (shown when API returns 401 or on first visit) -->
-<div id="login-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
-  background:rgba(0,0,0,0.95);z-index:300;align-items:center;justify-content:center;
-  font-family:var(--font);">
-  <form onsubmit="app.doAuth(event)" style="background:var(--surface);border:1px solid var(--border);
-    border-radius:12px;padding:2rem;width:340px;text-align:center;">
-    <h2 style="color:var(--accent);margin-bottom:.25rem;font-size:1.25rem;">CheetahClaws</h2>
-    <div id="auth-mode-label" style="color:var(--text-dim);font-size:.8rem;margin-bottom:1rem;">
-      Sign in to continue
-    </div>
-    <input type="text" id="login-username" placeholder="Username" autocomplete="username" autofocus
-      style="width:100%;padding:10px 12px;background:var(--panel);border:1px solid var(--border);
-      border-radius:8px;color:var(--text);font-size:.95rem;margin-bottom:.6rem;box-sizing:border-box;">
-    <input type="password" id="login-pwd" placeholder="Password" autocomplete="current-password"
-      style="width:100%;padding:10px 12px;background:var(--panel);border:1px solid var(--border);
-      border-radius:8px;color:var(--text);font-size:.95rem;margin-bottom:1rem;box-sizing:border-box;">
-    <button type="submit" id="auth-submit-btn"
-      style="background:var(--accent);color:#000;border:none;padding:10px 24px;
-      border-radius:8px;font-weight:700;font-size:.9rem;cursor:pointer;width:100%;">Sign in</button>
-    <div id="login-err" style="color:var(--red);font-size:.85rem;margin-top:.5rem;min-height:1.2em;"></div>
-    <div style="margin-top:.75rem;font-size:.8rem;color:var(--text-muted);">
-      <a href="#" id="auth-toggle-link" onclick="app.toggleAuthMode(event)"
-         style="color:var(--accent);text-decoration:none;">First time? Create an account</a>
+<div id="login-overlay" class="login-overlay" style="display:none;">
+  <form class="login-card" onsubmit="app.doAuth(event)">
+    <div class="login-logo">🐆</div>
+    <h2 class="login-title">CheetahClaws</h2>
+    <div id="auth-mode-label" class="login-sub">Sign in to continue</div>
+    <input type="text" id="login-username" class="login-input" placeholder="Username"
+           autocomplete="username" autofocus>
+    <input type="password" id="login-pwd" class="login-input" placeholder="Password"
+           autocomplete="current-password">
+    <label class="login-remember">
+      <input type="checkbox" id="login-remember" checked> Stay signed in
+    </label>
+    <button type="submit" id="auth-submit-btn" class="login-btn">Sign in</button>
+    <div id="login-err" class="login-err"></div>
+    <div class="login-toggle">
+      <a href="#" id="auth-toggle-link" onclick="app.toggleAuthMode(event)">First time? Create an account</a>
     </div>
   </form>
 </div>

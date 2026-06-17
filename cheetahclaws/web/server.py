@@ -1234,7 +1234,8 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
             try:
                 from cheetahclaws.web.db import init_db, repo as dbrepo
                 from cheetahclaws.web.auth import (verify_password, issue_token,
-                                       build_cookie)
+                                       build_cookie, JWT_TTL_SECONDS,
+                                       REMEMBER_TTL_SECONDS)
                 init_db()
                 rec = dbrepo.get_user_by_username(username)
                 if not rec or not verify_password(password,
@@ -1248,7 +1249,9 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                                request_origin=origin)
                     sock.close()
                     return
-                token = issue_token(rec["id"], rec["username"])
+                ttl = (REMEMBER_TTL_SECONDS if body_json.get("remember")
+                       else JWT_TTL_SECONDS)
+                token = issue_token(rec["id"], rec["username"], ttl=ttl)
                 from cheetahclaws.web.logging_setup import incr, get_logger
                 incr("auth_logins_total")
                 get_logger("auth").info("login", extra={
@@ -1260,7 +1263,7 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                                                 "username": rec["username"],
                                                 "is_admin": rec["is_admin"]}
                                        }).encode(),
-                           extra_headers=build_cookie(token),
+                           extra_headers=build_cookie(token, max_age=ttl),
                            request_origin=origin)
             except Exception as exc:  # noqa: BLE001
                 _send_http(sock, "500 Internal Server Error",
