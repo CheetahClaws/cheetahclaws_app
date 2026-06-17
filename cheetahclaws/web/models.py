@@ -12,6 +12,7 @@ free of timezone gotchas; the UI converts to local time client-side.
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 try:
     from sqlalchemy import (
@@ -36,8 +37,13 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True,
                                           nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # OAuth users have no local password → nullable.
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Third-party sign-in (Google / GitHub / WeChat). NULL for password users.
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    oauth_provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    oauth_sub: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[float] = mapped_column(Float, default=time.time,
                                               nullable=False)
 

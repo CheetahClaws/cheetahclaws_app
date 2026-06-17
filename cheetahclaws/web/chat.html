@@ -321,6 +321,17 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
 .login-toggle { margin-top:.85rem; font-size:.8rem; }
 .login-toggle a { color:var(--accent); text-decoration:none; }
 .login-toggle a:hover { text-decoration:underline; }
+.oauth-buttons { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+.oauth-buttons:not(:empty)::before {
+  content:"or"; display:block; color:var(--text-muted); font-size:.74rem; margin:4px 0 2px;
+}
+.oauth-btn {
+  display:flex; align-items:center; justify-content:center;
+  padding:10px 14px; border:1px solid var(--border); border-radius:var(--radius);
+  background:var(--panel); color:var(--text); font-size:.88rem; font-weight:600;
+  cursor:pointer; text-decoration:none; transition:border-color .15s, background .15s;
+}
+.oauth-btn:hover { border-color:var(--accent); background:var(--surface); }
 
 #sess-menu .menu-item {
   padding:7px 12px; cursor:pointer; border-radius:4px; color:var(--text);
@@ -654,6 +665,7 @@ body.resizing { cursor:col-resize; user-select:none; }
     </label>
     <button type="submit" id="auth-submit-btn" class="login-btn">Sign in</button>
     <div id="login-err" class="login-err"></div>
+    <div id="oauth-buttons" class="oauth-buttons"></div>
     <div class="login-toggle">
       <a href="#" id="auth-toggle-link" onclick="app.toggleAuthMode(event)">First time? Create an account</a>
     </div>

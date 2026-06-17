@@ -582,6 +582,16 @@ def _csrf_exempt(path: str) -> bool:
     return path in _CSRF_EXEMPT_PATHS
 
 
+def _oauth_redirect_uri(provider: str, headers: dict) -> str:
+    """The callback URL registered with the provider. Prefer an explicit
+    CHEETAHCLAWS_PUBLIC_URL; otherwise derive it from the request Host."""
+    base = os.environ.get("CHEETAHCLAWS_PUBLIC_URL", "").rstrip("/")
+    if not base:
+        scheme = "https" if headers.get("x-forwarded-proto") == "https" else "http"
+        base = f"{scheme}://{headers.get('host', 'localhost')}"
+    return f"{base}/api/auth/oauth/{provider}/callback"
+
+
 def _check_auth(query: str = "", body_token: str = "",
                 cookie_str: str = "") -> bool:
     """Check terminal (/index.html) password auth — one-time generated pwd.
@@ -1181,6 +1191,76 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                 return
             _send_json(sock, {"has_users": has_users,
                               "no_auth": _server_no_auth},
+                       request_origin=origin)
+            sock.close()
+            return
+
+        # GET /api/auth/providers — which OAuth providers are configured
+        if path == "/api/auth/providers" and method == "GET":
+            from cheetahclaws.web import oauth
+            _send_json(sock, {"providers": oauth.configured_providers()},
+                       request_origin=origin)
+            sock.close()
+            return
+
+        # GET /api/auth/oauth/<provider>/start — redirect to the provider
+        if (path.startswith("/api/auth/oauth/") and path.endswith("/start")
+                and method == "GET"):
+            from cheetahclaws.web import oauth
+            provider = path[len("/api/auth/oauth/"):-len("/start")]
+            cfg = oauth.provider_config(provider)
+            if not cfg:
+                _send_http(sock, "404 Not Found", "text/plain",
+                           b"provider not configured", request_origin=origin)
+                sock.close()
+                return
+            state = oauth.new_state()
+            url = oauth.build_authorize_url(
+                cfg, _oauth_redirect_uri(provider, headers), state)
+            set_state = (f"Set-Cookie: ccoauth={state}; Path=/; HttpOnly; "
+                         f"SameSite=Lax; Max-Age=600\r\n")
+            _send_http(sock, "302 Found", "text/html", b"",
+                       extra_headers=f"Location: {url}\r\n" + set_state,
+                       request_origin=origin)
+            sock.close()
+            return
+
+        # GET /api/auth/oauth/<provider>/callback — exchange code, sign in
+        if (path.startswith("/api/auth/oauth/") and path.endswith("/callback")
+                and method == "GET"):
+            from urllib.parse import parse_qs
+            from cheetahclaws.web import oauth
+            from cheetahclaws.web.auth import issue_token, build_cookie
+            from cheetahclaws.web.db import init_db, repo as dbrepo
+            provider = path[len("/api/auth/oauth/"):-len("/callback")]
+            cfg = oauth.provider_config(provider)
+            qs = parse_qs(query)
+            code = (qs.get("code") or [""])[0]
+            state = (qs.get("state") or [""])[0]
+            cookie_state = ""
+            for part in cookie.split(";"):
+                if part.strip().startswith("ccoauth="):
+                    cookie_state = part.strip()[len("ccoauth="):]
+            info = (oauth.exchange_and_fetch(
+                        cfg, code, _oauth_redirect_uri(provider, headers))
+                    if (cfg and code and state and state == cookie_state)
+                    else None)
+            if not info or not info.get("sub"):
+                _send_http(sock, "302 Found", "text/html", b"",
+                           extra_headers="Location: /chat?login_error=oauth\r\n",
+                           request_origin=origin)
+                sock.close()
+                return
+            init_db()
+            user = (dbrepo.get_user_by_oauth(info["provider"], info["sub"])
+                    or dbrepo.create_oauth_user(
+                        info["provider"], info["sub"],
+                        info.get("email", ""), info.get("name", "")))
+            token = issue_token(user["id"], user["username"])
+            clear_state = "Set-Cookie: ccoauth=; Path=/; Max-Age=0\r\n"
+            _send_http(sock, "302 Found", "text/html", b"",
+                       extra_headers="Location: /chat\r\n"
+                                     + build_cookie(token) + clear_state,
                        request_origin=origin)
             sock.close()
             return

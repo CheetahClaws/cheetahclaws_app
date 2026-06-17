@@ -4,6 +4,32 @@ Object.assign(ChatApp.prototype, {
 
   _showLogin() {
     document.getElementById('login-overlay').style.display = 'flex';
+    this._renderOAuthButtons();
+    // Surface a failed OAuth round-trip (callback redirects with ?login_error).
+    if (/[?&]login_error=/.test(location.search)) {
+      const e = document.getElementById('login-err');
+      if (e) e.textContent = 'Third-party sign-in failed. Please try again.';
+      history.replaceState(null, '', location.pathname);
+    }
+  },
+
+  // Render a "Continue with …" button per configured OAuth provider (the
+  // backend only lists providers whose credentials are set).
+  async _renderOAuthButtons() {
+    const box = document.getElementById('oauth-buttons');
+    if (!box) return;
+    box.innerHTML = '';
+    try {
+      const r = await fetch('/api/auth/providers', {credentials: 'same-origin'});
+      const d = await r.json();
+      for (const p of (d.providers || [])) {
+        const a = document.createElement('a');
+        a.className = 'oauth-btn';
+        a.href = `/api/auth/oauth/${encodeURIComponent(p.name)}/start`;
+        a.textContent = `Continue with ${p.label}`;
+        box.appendChild(a);
+      }
+    } catch (_) { /* no providers / offline → just password login */ }
   },
 
   _hideLogin() {

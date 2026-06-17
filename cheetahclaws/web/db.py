@@ -76,6 +76,15 @@ def init_db(db_path: Optional[Path] = None) -> None:
                     "CREATE INDEX IF NOT EXISTS ix_chat_sessions_folder_id"
                     " ON chat_sessions(folder_id)"
                 )
+            # Add OAuth columns to pre-existing users tables (third-party login).
+            ucols = {row[1] for row in conn.exec_driver_sql(
+                "PRAGMA table_info(users)").fetchall()}
+            for _col, _typ in (("email", "VARCHAR(255)"),
+                               ("oauth_provider", "VARCHAR(32)"),
+                               ("oauth_sub", "VARCHAR(128)")):
+                if _col not in ucols:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE users ADD COLUMN {_col} {_typ}")
         _SessionLocal = sessionmaker(bind=_engine, autoflush=False,
                                      expire_on_commit=False, future=True)
         # Tighten file permissions — the DB now holds password hashes & API keys.
@@ -144,6 +153,42 @@ class repo:
             db.flush()
             return {"id": u.id, "username": u.username,
                     "is_admin": u.is_admin, "created_at": u.created_at}
+
+    @staticmethod
+    def get_user_by_oauth(provider: str, sub: str) -> Optional[dict]:
+        with session_scope() as db:
+            u = db.scalar(select(User).where(
+                User.oauth_provider == provider, User.oauth_sub == sub))
+            if not u:
+                return None
+            return {"id": u.id, "username": u.username, "is_admin": u.is_admin,
+                    "email": u.email, "created_at": u.created_at}
+
+    @staticmethod
+    def create_oauth_user(provider: str, sub: str, email: str = "",
+                          name: str = "") -> dict:
+        import re
+        import secrets as _secrets
+        from cheetahclaws.web.auth import hash_password
+        base = re.sub(r"[^a-zA-Z0-9_]", "",
+                      (name or (email.split("@")[0] if email else "")
+                       or f"{provider}{sub}"))[:24] or provider
+        with session_scope() as db:
+            first_user = db.scalar(select(User.id).limit(1)) is None
+            uname = base
+            while db.scalar(select(User).where(User.username == uname)):
+                uname = f"{base}_{_secrets.token_hex(2)}"
+            # No usable password — a random unguessable bcrypt hash keeps the
+            # password-login path from ever matching and satisfies the NOT NULL
+            # column on pre-existing databases.
+            u = User(username=uname,
+                     password_hash=hash_password(_secrets.token_urlsafe(32)),
+                     email=email or None, oauth_provider=provider, oauth_sub=sub,
+                     is_admin=first_user)
+            db.add(u)
+            db.flush()
+            return {"id": u.id, "username": u.username, "is_admin": u.is_admin,
+                    "email": u.email, "created_at": u.created_at}
 
     # ── Chat sessions ──────────────────────────────────────────────────
 
