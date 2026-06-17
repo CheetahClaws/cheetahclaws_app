@@ -1,0 +1,87 @@
+name: Build desktop installers
+
+# Builds the self-contained CheetahClaws desktop app on GitHub-hosted runners
+# (clean envs — none of the local electron/path.txt/permission gotchas) and
+# attaches the installers to a GitHub Release.
+#
+#   • Push a tag like `v0.1.0`  → builds all platforms + publishes a Release
+#   • Run manually (Actions tab) → builds all platforms, installers as artifacts
+#
+# End users then just download the .dmg / .exe / .AppImage from Releases —
+# no Python, no Node required to run them.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create/update the Release
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest      # Apple Silicon
+            label: macOS (arm64)
+            pattern: desktop/out/*.dmg
+          - os: macos-13          # Intel
+            label: macOS (x64)
+            pattern: desktop/out/*.dmg
+          - os: windows-latest
+            label: Windows (x64)
+            pattern: desktop/out/*.exe
+          - os: ubuntu-latest
+            label: Linux (x64)
+            pattern: desktop/out/*.AppImage
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 1) Freeze `cheetahclaws --web` into a standalone server binary.
+      #    The runner's Python is clean (only what we install), so the bundle
+      #    stays lean — no need for the local build-server.sh venv dance.
+      - name: Freeze the Python server (PyInstaller)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[web]"
+          pip install pyinstaller
+          ( cd desktop/server && pyinstaller cheetahclaws-server.spec --noconfirm --log-level WARN )
+
+      # 2) Package the Electron shell around it → native installer.
+      - name: Build the installer (electron-builder)
+        shell: bash
+        working-directory: desktop
+        run: |
+          npm install
+          npm run dist
+
+      # 3a) On a tag → publish to the GitHub Release (download page).
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.pattern }}
+          fail_on_unmatched_files: true
+
+      # 3b) On a manual run → keep the installer as a downloadable artifact.
+      - name: Upload artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheetahclaws-${{ matrix.os }}
+          path: ${{ matrix.pattern }}
+          if-no-files-found: error

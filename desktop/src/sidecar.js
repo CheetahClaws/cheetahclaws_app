@@ -45,7 +45,11 @@ function startSidecar(opts = {}) {
 
     let child;
     try {
-      child = spawn(command, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(command, args, {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,   // don't flash a console window on Windows
+      });
     } catch (err) {
       return reject(new Error(`failed to launch "${command}": ${err.message}`));
     }
