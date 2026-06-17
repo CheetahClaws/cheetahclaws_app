@@ -106,8 +106,8 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
   transition:transform .25s ease;
 }
 #sidebar .hdr {
-  padding:16px; border-bottom:1px solid var(--border);
-  display:flex; align-items:center; justify-content:space-between;
+  padding:14px 16px; border-bottom:1px solid var(--border);
+  display:flex; flex-direction:column; gap:10px;   /* title row, then buttons row */
 }
 #sidebar .hdr h2 { font-size:15px; color:var(--accent); font-weight:700; }
 #sidebar .new-btn {
@@ -116,6 +116,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
 }
 #sidebar .new-btn:hover { opacity:.85; }
 #sidebar .hdr-buttons { display:flex; gap:6px; }
+#sidebar .hdr-buttons > button { flex:1 1 0; min-width:0; white-space:nowrap; padding:6px 8px; }
 #sidebar .select-btn {
   background:transparent; color:var(--text-dim); border:1px solid var(--border);
   padding:5px 10px; border-radius:var(--radius-sm); font-weight:600; font-size:12px;
